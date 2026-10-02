@@ -31,10 +31,13 @@ from chatter_prompts import (
     build_event_conversation_prompt,
     build_event_statement_prompt,
 )
+from chatter_identity import prepare_channel_persona
 from chatter_shared import (
+    get_chatter_mode,
     get_zone_name,
     get_class_name,
     get_race_name,
+    attach_speaker_gear,
     run_single_reaction,
     get_effective_speaker_cooldown,
     call_llm,
@@ -44,6 +47,7 @@ from chatter_shared import (
     strip_speaker_prefix,
     cleanup_message,
     calculate_dynamic_delay,
+    _reserve_zone_delivery_window,
 )
 
 logger = logging.getLogger(__name__)
@@ -186,13 +190,26 @@ def _deliver_conversation(
             ),
         })
 
+    attach_speaker_gear(db, formatted, config)
+    mode = get_chatter_mode(config)
+    for b in formatted:
+        b['persona'] = prepare_channel_persona(
+            db, client, config, b['guid'], b['name'], 'general',
+            event.setdefault('_prepared_personas', {}),
+        )
+
     bot_names = [b['name'] for b in formatted]
     bot_guids = {
         b['name']: b['guid'] for b in formatted
     }
 
-    current_weather = extra_data.get(
-        'current_weather', 'clear'
+    # A weather event describes the new weather itself; the
+    # stored value is the weather it replaced. Never assume
+    # "clear" when nothing is known.
+    current_weather = (
+        None
+        if str(event.get('event_type', '')).startswith('weather')
+        else extra_data.get('current_weather') or None
     )
     recent_msgs = get_recent_zone_messages(
         db, zone_id
@@ -234,7 +251,8 @@ def _deliver_conversation(
         messages, label='event_conv',
     )
 
-    cumulative_delay = 0.0
+    prepared = []
+    relative_delay = 0.0
     for i, msg in enumerate(messages):
         bot_guid = bot_guids.get(
             msg['name'],
@@ -252,7 +270,22 @@ def _deliver_conversation(
             delay = calculate_dynamic_delay(
                 len(final_message), config,
             )
-            cumulative_delay += delay
+            relative_delay += delay
+
+        prepared.append((
+            i, msg, bot_guid, final_message,
+            relative_delay,
+        ))
+
+    base_delay = _reserve_zone_delivery_window(
+        zone_id, config,
+        duration_seconds=relative_delay,
+    )
+    for (
+        i, msg, bot_guid, final_message,
+        relative_delay,
+    ) in prepared:
+        cumulative_delay = base_delay + relative_delay
 
         insert_chat_message(
             db,
@@ -299,6 +332,11 @@ def _deliver_statement(
         get_zone_name(use_zone_id) or "the world"
     )
 
+    bot['persona'] = prepare_channel_persona(
+        db, client, config, int(bot['bot1_guid']), bot['bot1_name'],
+        'general', event.setdefault('_prepared_personas', {}),
+    )
+
     event_context = build_event_context(event)
     event_prompt = build_event_statement_prompt(
         bot,
@@ -319,6 +357,14 @@ def _deliver_statement(
         'LLMChatter.MessageDelayMax', 30000
     ))
     delay_ms = random.randint(delay_min, delay_max)
+    initial_delay = delay_ms / 1000.0
+
+    def resolve_delivery_delay(_message):
+        base_delay = _reserve_zone_delivery_window(
+            use_zone_id, config,
+            duration_seconds=initial_delay,
+        )
+        return base_delay + initial_delay
 
     result = run_single_reaction(
         db,
@@ -328,7 +374,8 @@ def _deliver_statement(
         speaker_name=bot['bot1_name'],
         bot_guid=int(bot['bot1_guid']),
         channel='general',
-        delay_seconds=delay_ms // 1000,
+        delay_seconds=initial_delay,
+        delay_resolver=resolve_delivery_delay,
         event_id=event_id,
         bypass_speaker_cooldown=True,
         context=(
@@ -349,7 +396,9 @@ def _deliver_statement(
             int(event.get('map_id') or 0),
             source_event_id=event_id,
             source_sequence=0,
-            source_delay_seconds=delay_ms // 1000,
+            source_delay_seconds=result[
+                'delay_seconds'
+            ],
         )
         mark_event(db, event_id, 'completed')
         return True

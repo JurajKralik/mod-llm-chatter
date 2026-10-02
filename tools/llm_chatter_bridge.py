@@ -30,14 +30,13 @@ import openai
 
 import chatter_ambient
 
+from chatter_identity import config_int as profile_config_int
+from chatter_identity_jobs import prepare_guild_profiles, guild_profiles_enabled
 from chatter_constants import (
     DEFAULT_ANTHROPIC_MODEL,
     DEFAULT_GOOGLE_MODEL,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_OPENROUTER_MODEL,
-    MSG_TYPE_PLAIN, MSG_TYPE_QUEST,
-    MSG_TYPE_LOOT, MSG_TYPE_QUEST_REWARD,
-    MSG_TYPE_TRADE, MSG_TYPE_SPELL,
     GOOGLE_OPENAI_BASE_URL,
     OPENROUTER_BASE_URL,
 )
@@ -73,17 +72,23 @@ from chatter_group import (
     check_bot_questions,
 )
 from chatter_group_state import (
+    normalize_active_group_personalities,
     regenerate_missing_identity_tones,
 )
 from chatter_general import (
     init_general_config,
     process_general_player_msg_event,
 )
-from chatter_cache import refill_precache_pool
+from chatter_cache import (
+    discard_ready_precache,
+    refill_precache_pool,
+)
 from chatter_event_registry import (
     build_handler_map,
     validate_registry,
 )
+from llm_compat import describe_model_compatibility
+from chatter_llm import compatible_reasoning_effort
 
 # Configure logging
 logging.basicConfig(
@@ -1305,6 +1310,10 @@ def main():
             'LLMChatter.OpenAI.ApiKey', ''
         )
         if not api_key:
+            logger.error(
+                "FATAL: provider 'openai' selected but "
+                "LLMChatter.OpenAI.ApiKey is empty."
+            )
             sys.exit(1)
         client = openai.OpenAI(api_key=api_key)
     elif provider == 'google':
@@ -1312,6 +1321,10 @@ def main():
             'LLMChatter.Google.ApiKey', ''
         )
         if not api_key:
+            logger.error(
+                "FATAL: provider 'google' selected but "
+                "LLMChatter.Google.ApiKey is empty."
+            )
             sys.exit(1)
         client = openai.OpenAI(
             api_key=api_key,
@@ -1325,6 +1338,10 @@ def main():
             'LLMChatter.OpenRouter.ApiKey', ''
         )
         if not api_key:
+            logger.error(
+                "FATAL: provider 'openrouter' selected but "
+                "LLMChatter.OpenRouter.ApiKey is empty."
+            )
             sys.exit(1)
         headers = {}
         referer = config.get(
@@ -1348,11 +1365,24 @@ def main():
             kwargs['default_headers'] = headers
         client = openai.OpenAI(**kwargs)
     else:
-        # Anthropic (default)
+        # Anthropic is the documented default when Provider is unset.
+        # A *typo* in LLMChatter.Provider also lands here; fail loudly
+        # rather than silently pretending Anthropic was intended.
+        if provider != 'anthropic':
+            logger.error(
+                "FATAL: unknown LLMChatter.Provider '%s'. Valid values: "
+                "anthropic, openai, google, openrouter, ollama.",
+                provider,
+            )
+            sys.exit(1)
         api_key = config.get(
             'LLMChatter.Anthropic.ApiKey', ''
         )
         if not api_key:
+            logger.error(
+                "FATAL: provider 'anthropic' selected but "
+                "LLMChatter.Anthropic.ApiKey is empty."
+            )
             sys.exit(1)
         client = anthropic.Anthropic(api_key=api_key)
 
@@ -1412,13 +1442,21 @@ def main():
     logger.info(
         f"Model: {model}"
     )
+    if provider in (
+        'openai', 'google', 'openrouter', 'ollama'
+    ):
+        logger.info(
+            "Model compatibility: %s",
+            describe_model_compatibility(
+                provider,
+                model,
+                compatible_reasoning_effort(provider, config),
+            ),
+        )
     if provider == 'ollama':
         base_url = config.get(
             'LLMChatter.Ollama.BaseUrl',
             'http://localhost:11434'
-        )
-        context_size = config.get(
-            'LLMChatter.Ollama.ContextSize', 2048
         )
         disable_thinking = (
             config.get(
@@ -1427,10 +1465,9 @@ def main():
             ) == '1'
         )
         logger.info(f"Ollama URL: {base_url}")
-        logger.info(f"Context size: {context_size}")
         logger.info(
             f"Thinking mode: "
-            f"{'disabled (/no_think)' if disable_thinking else 'enabled'}"
+            f"{'disabled' if disable_thinking else 'enabled'}"
         )
     logger.info(f"Poll interval: {poll_interval}s")
     logger.info(
@@ -1452,17 +1489,6 @@ def main():
         f"Event system: "
         f"{'enabled' if use_event_system else 'disabled'}"
     )
-    logger.info(
-        f"Message type distribution: "
-        f"{MSG_TYPE_PLAIN}% plain, "
-        f"{MSG_TYPE_QUEST - MSG_TYPE_PLAIN}% quest, "
-        f"{MSG_TYPE_LOOT - MSG_TYPE_QUEST}% loot, "
-        f"{MSG_TYPE_QUEST_REWARD - MSG_TYPE_LOOT}% "
-        f"quest+reward, "
-        f"{MSG_TYPE_TRADE - MSG_TYPE_QUEST_REWARD}% "
-        f"trade, "
-        f"{MSG_TYPE_SPELL - MSG_TYPE_TRADE}% spell"
-    )
     precache_enabled = config.get(
         'LLMChatter.GroupChatter.PreCacheEnable',
         '1'
@@ -1477,13 +1503,11 @@ def main():
     )
     logger.info(
         f"  ChatterMode: "
-        f"{config.get('LLMChatter.ChatterMode', 'roleplay')}"
+        f"{config.get('LLMChatter.ChatterMode', 'normal')}"
     )
     logger.info(
         f"  Ollama.BaseUrl: "
         f"{config.get('LLMChatter.Ollama.BaseUrl', 'http://localhost:11434')}"
-        f"  ContextSize: "
-        f"{config.get('LLMChatter.Ollama.ContextSize', 2048)}"
         f"  DisableThinking: "
         f"{config.get('LLMChatter.Ollama.DisableThinking', 1)}"
     )
@@ -1610,11 +1634,11 @@ def main():
     logger.info("General chat:")
     logger.info(
         f"  ReactionChance: "
-        f"{config.get('LLMChatter.GeneralChat.ReactionChance', 40)}%"
+        f"{config.get('LLMChatter.GeneralChat.ReactionChance', 100)}%"
         f"  QuestionChance: "
-        f"{config.get('LLMChatter.GeneralChat.QuestionChance', 80)}%"
+        f"{config.get('LLMChatter.GeneralChat.QuestionChance', 100)}%"
         f"  Cooldown: "
-        f"{config.get('LLMChatter.GeneralChat.Cooldown', 30)}s"
+        f"{config.get('LLMChatter.GeneralChat.Cooldown', 0)}s"
     )
     logger.info("-" * 60)
     logger.info("Guild chatter:")
@@ -1804,8 +1828,6 @@ def main():
     logger.info(
         f"  EventExpiration: "
         f"{config.get('LLMChatter.EventExpirationSeconds', 600)}s"
-        f"  LootRecentCooldown: "
-        f"{config.get('LLMChatter.LootRecentCooldownSeconds', 1200)}s"
     )
     logger.info(
         f"  BGChatter.MaxTokens: "
@@ -1894,6 +1916,8 @@ def main():
         try:
             db = get_db_connection(config)
             reset_stuck_processing_events(db)
+            discard_ready_precache(db)
+            normalize_active_group_personalities(db, config)
 
             # Memory system startup recovery
             if int(config.get(
@@ -1955,6 +1979,8 @@ def main():
     bot_question_future = None
     legacy_future = None
     tone_regen_future = None
+    guild_profile_future = None
+    last_guild_profile_scan = 0
     # Track online→offline transition for full wipe
     was_players_online = True
 
@@ -2038,6 +2064,10 @@ def main():
                     "tone-regeneration"
                 )
                 tone_regen_future = None
+
+            if guild_profile_future and guild_profile_future.done():
+                _harvest_future(guild_profile_future, "guild-profiles")
+                guild_profile_future = None
 
             # DB connection with proper lifecycle
             db = None
@@ -2196,6 +2226,23 @@ def main():
                                 future
                             )
                             dispatched += 1
+
+                if (
+                    players_online
+                    and guild_profiles_enabled(config)
+                    and guild_profile_future is None
+                    and current_time - last_guild_profile_scan
+                    >= profile_config_int(
+                        config, 'LLMChatter.Profile.GuildScanIntervalSeconds',
+                        15, 1,
+                    )
+                    and not _has_urgent_event_backlog(db, _PRIORITY_URGENT_FLOOR)
+                ):
+                    last_guild_profile_scan = current_time
+                    guild_profile_future = executor.submit(
+                        _run_in_worker, "guild-profiles",
+                        prepare_guild_profiles, client, config,
+                    )
 
                 # Idle chatter -> worker pool
                 if (

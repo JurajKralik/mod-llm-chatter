@@ -5,6 +5,7 @@ import random
 from typing import Dict, List, Optional, Tuple
 
 from chatter_db import insert_chat_message
+from chatter_identity import prepare_guild_speakers
 from chatter_general import _pick_length_hint
 from chatter_guild import (
     _apply_participant_references,
@@ -14,21 +15,36 @@ from chatter_guild import (
     _insert_reference_names,
     _participant_identity_lines,
     _query_speaker,
+    _speaker_faction,
     _select_participant_references,
     _strip_rp_artifacts,
     _valid_guild_conversation,
 )
 from chatter_llm import call_llm
+from chatter_mode import build_player_chat_guidance, is_roleplay
 from chatter_prompts import (
     generate_conversation_length_sequence,
-    generate_conversation_mood_sequence,
+)
+from chatter_threads import (
+    guild_key,
+    note_player_message,
+    render_for_player_reply,
+)
+from chatter_persona import (
+    CONVERSATION_EMOTION_RULE,
+    PERSONA_PRIORITY_RULE,
 )
 from chatter_shared import (
     append_conversation_json_instruction,
     append_json_instruction,
+    build_conversational_scale_guidance,
+    brief_casual_response_fits,
+    build_brief_casual_repair_prompt,
     build_conversation_json_repair_prompt,
     calculate_dynamic_delay,
     find_addressed_bot,
+    should_reply_to_optional_casual,
+    get_chatter_mode,
     parse_conversation_response,
     parse_extra_data,
     select_conversation_message_count,
@@ -122,6 +138,7 @@ def _fetch_session_context(
 def _format_session_context(
     summary: str,
     recent: List[Dict],
+    mode: str = 'roleplay',
 ) -> str:
     blocks = []
     if summary:
@@ -155,6 +172,11 @@ def _format_session_context(
             "during this session:",
             "\n".join(lines),
         ])
+    if blocks and not is_roleplay(mode):
+        blocks.append(
+            "Older bot lines may use roleplay voice. Treat their events as "
+            "gameplay context and reply only in normal player voice."
+        )
     return "\n".join(blocks)
 
 
@@ -197,6 +219,17 @@ def _load_candidates(db, candidates: List[Dict]) -> List[Dict]:
     return loaded
 
 
+def _filter_candidates_by_faction(
+    candidates: List[Dict], faction: str,
+) -> List[Dict]:
+    if faction not in ('Alliance', 'Horde'):
+        return []
+    return [
+        candidate for candidate in candidates
+        if _speaker_faction(candidate['speaker']) == faction
+    ]
+
+
 def _recent_bot_names(recent: List[Dict]) -> List[str]:
     return [
         str(row.get('speaker_name') or '')
@@ -204,6 +237,38 @@ def _recent_bot_names(recent: List[Dict]) -> List[str]:
         if row.get('is_bot')
         and row.get('speaker_name')
     ]
+
+
+def _immediately_prior_bot(
+    recent: List[Dict],
+    candidates: List[Dict],
+    player_name: str,
+    player_message: str,
+) -> str:
+    """Resolve the bot directly before the current player turn."""
+    if len(recent) < 2:
+        return ''
+
+    current = recent[-1]
+    previous = recent[-2]
+    if (
+        current.get('is_bot')
+        or str(current.get('speaker_name') or '').casefold()
+        != player_name.casefold()
+        or str(current.get('message') or '').strip()
+        != player_message.strip()
+        or not previous.get('is_bot')
+    ):
+        return ''
+
+    previous_name = str(
+        previous.get('speaker_name') or ''
+    ).casefold()
+    for candidate in candidates:
+        name = str(candidate.get('name') or '')
+        if name.casefold() == previous_name:
+            return name
+    return ''
 
 
 def _weighted_pick(
@@ -381,25 +446,29 @@ def _shared_prompt_lines(
     player_message: str,
     session_context: str,
     callback_requested: bool,
+    mode: str = 'roleplay',
+    brief_casual: bool = False,
 ) -> List[str]:
-    lines = [
-        "Write natural in-character World of Warcraft "
-        "Guild Chat.",
-        f"The guild is \"{guild_name}\".",
-    ]
+    lines = [f"The guild is \"{guild_name}\"."]
+    if is_roleplay(mode):
+        lines.insert(
+            0, "Write natural in-character World of Warcraft Guild Chat."
+        )
+    else:
+        lines.insert(0, build_player_chat_guidance(mode, 'guild'))
     for participant in participants:
         lines.extend(
-            _participant_identity_lines(participant)
+            _participant_identity_lines(participant, mode)
         )
 
-    if faction:
+    if faction and is_roleplay(mode):
         lines.append(
             f"They fight for the {faction}. Never "
             f"insult or mock the {faction}, their own "
             "faction."
         )
     lines.extend(
-        _guild_location_lines(participants, False)
+        _guild_location_lines(participants, False, mode)
     )
     if session_context:
         lines.extend(["", session_context])
@@ -416,18 +485,25 @@ def _shared_prompt_lines(
         "Preserve unresolved questions and promises "
         "naturally; do not recite the memory.",
         "Do not invent facts that were not said.",
-        "Guild Chat reaches across Azeroth. Never imply "
+        "Guild Chat reaches across the game world. Never imply "
         "the speakers can see, touch, or stand beside "
         "one another.",
-        "Each line is spoken text only: no narrator "
-        "text, roleplay asterisks, slash commands, "
-        "emotes, or name prefixes.",
-        "Stay fully in Azeroth and avoid game-mechanic "
-        "terms such as DPS, specs, talents, loot, mobs, "
-        "XP, levels, rotations, addons, or players "
-        "behind screens.",
+        (
+            "For this brief turn, use either concise spoken text or one "
+            "short third-person narrator action featuring the speaker. "
+            "Do not use roleplay asterisks, slash commands, or name "
+            "prefixes."
+            if brief_casual
+            else "Each line is spoken text only: no narrator text, "
+            "roleplay asterisks, slash commands, emotes, or name prefixes."
+        ),
         "Never exceed 150 characters in one message.",
+        build_conversational_scale_guidance(),
     ])
+    if is_roleplay(mode):
+        lines.append(
+            "Stay fully in Azeroth and avoid game-mechanic terms."
+        )
     if callback_requested:
         lines.append(
             "If genuinely relevant, make one subtle "
@@ -453,6 +529,8 @@ def _build_single_prompt(
     callback_requested: bool,
     name_requested: bool,
     question_requested: bool,
+    mode: str = 'roleplay',
+    brief_casual: bool = False,
 ) -> str:
     lines = _shared_prompt_lines(
         [participant],
@@ -462,13 +540,28 @@ def _build_single_prompt(
         player_message,
         session_context,
         callback_requested,
+        mode,
+        brief_casual,
     )
-    lines.extend([
-        "",
-        f"{participant['name']} gives one direct, "
-        "meaningful reply.",
-        _pick_length_hint('roleplay'),
-    ])
+    lines.append("")
+    if brief_casual:
+        lines.extend([
+            f"{participant['name']} gives one casual "
+            "acknowledgement.",
+            build_conversational_scale_guidance(
+                force_brief=True,
+            ),
+            "A simple acknowledgement is enough; do not embellish it.",
+            "You may instead use one short third-person narrator action "
+            f"featuring {participant['name']}, with no added speech.",
+        ])
+    else:
+        lines.extend([
+            f"{participant['name']} gives one direct, "
+            "meaningful reply.",
+            _pick_length_hint(mode),
+            build_conversational_scale_guidance(),
+        ])
     if name_requested:
         lines.append(
             f"Naturally address {player_name} by name "
@@ -488,6 +581,7 @@ def _build_single_prompt(
         "\n".join(lines),
         allow_action=False,
         message_only=True,
+        allow_narrator_message=brief_casual,
     )
 
 
@@ -503,7 +597,9 @@ def _build_multi_prompt(
     name_requested: bool,
     question_requested: bool,
     config: Dict,
+    brief_casual: bool = False,
 ) -> Tuple[str, List[Dict], int]:
+    mode = get_chatter_mode(config)
     names = [
         participant['name']
         for participant in participants
@@ -564,6 +660,8 @@ def _build_multi_prompt(
         player_message,
         session_context,
         callback_requested,
+        mode,
+        brief_casual,
     )
     lines.append("")
     if topology == 'multi_reply':
@@ -585,11 +683,16 @@ def _build_multi_prompt(
             "Every selected bot must speak at least once.",
         ])
 
-    moods = generate_conversation_mood_sequence(
-        message_count, 'roleplay'
+    lines.append(
+        PERSONA_PRIORITY_RULE.format(who='the speakers')
     )
-    lengths = generate_conversation_length_sequence(
-        message_count
+    lines.append(CONVERSATION_EMOTION_RULE)
+    lengths = (
+        ["2-8 words, max 50 chars"] * message_count
+        if brief_casual
+        else generate_conversation_length_sequence(
+            message_count
+        )
     )
     sequence_names = [
         names[index % len(names)]
@@ -603,7 +706,6 @@ def _build_multi_prompt(
     for index, speaker in enumerate(sequence_names):
         instruction = (
             f"  Message {index + 1} ({speaker}): "
-            f"mood={moods[index]}, "
             f"length={lengths[index]}"
         )
         plan = reference_by_index.get(index)
@@ -629,12 +731,17 @@ def _build_multi_prompt(
             )
         lines.append(instruction)
 
+    lines.append(build_conversational_scale_guidance(
+        force_brief=brief_casual,
+    ))
+
     prompt = append_conversation_json_instruction(
         "\n".join(lines),
         sequence_names,
         message_count,
         allow_action=False,
         message_only=True,
+        allow_narrator_messages=brief_casual,
     )
     return prompt, reference_plans, message_count
 
@@ -655,6 +762,9 @@ def _generate_single_reply(
     question_requested: bool,
     metadata: Dict,
 ) -> List[Dict]:
+    brief_casual = bool(
+        metadata.get('guild_brief_casual')
+    )
     prompt = _build_single_prompt(
         participant,
         guild_name,
@@ -665,6 +775,8 @@ def _generate_single_reply(
         callback_requested,
         name_requested,
         question_requested,
+        get_chatter_mode(config),
+        brief_casual=brief_casual,
     )
     response = call_llm(
         client,
@@ -686,8 +798,16 @@ def _generate_single_reply(
         parsed.get('message', ''),
         participant['name'],
     )
-    if not text:
-        repair_prompt = (
+    if (
+        not text
+        or (
+            brief_casual
+            and not brief_casual_response_fits(text)
+        )
+    ):
+        repair_prompt = build_brief_casual_repair_prompt(
+            prompt
+        ) if brief_casual else (
             prompt
             + "\n\nYour previous output did not contain "
             "a usable spoken message. Return exactly one "
@@ -715,7 +835,13 @@ def _generate_single_reply(
             parsed.get('message', ''),
             participant['name'],
         )
-    if not text:
+    if (
+        not text
+        or (
+            brief_casual
+            and not brief_casual_response_fits(text)
+        )
+    ):
         return []
     return [{
         'name': participant['name'],
@@ -740,6 +866,9 @@ def _generate_multi_reply(
     question_requested: bool,
     metadata: Dict,
 ) -> List[Dict]:
+    brief_casual = bool(
+        metadata.get('guild_brief_casual')
+    )
     prompt, reference_plans, message_count = (
         _build_multi_prompt(
             participants,
@@ -753,6 +882,7 @@ def _generate_multi_reply(
             name_requested,
             question_requested,
             config,
+            brief_casual=brief_casual,
         )
     )
     names = [
@@ -789,10 +919,23 @@ def _generate_multi_reply(
         )
     )[:message_count]
 
-    if not _valid_guild_conversation(
+    structure_valid = _valid_guild_conversation(
         messages, names
-    ):
+    )
+    brief_valid = (
+        not brief_casual
+        or all(
+            brief_casual_response_fits(
+                str(message.get('message') or '')
+            )
+            for message in messages
+        )
+    )
+    if not structure_valid or not brief_valid:
         repair_prompt = (
+            build_brief_casual_repair_prompt(prompt)
+            if brief_casual and structure_valid
+            else
             build_conversation_json_repair_prompt(
                 prompt,
                 names,
@@ -817,8 +960,17 @@ def _generate_multi_reply(
             )
         )[:message_count]
 
-    if not _valid_guild_conversation(
-        messages, names
+    if (
+        not _valid_guild_conversation(messages, names)
+        or (
+            brief_casual
+            and not all(
+                brief_casual_response_fits(
+                    str(message.get('message') or '')
+                )
+                for message in messages
+            )
+        )
     ):
         return []
     if reference_plans:
@@ -1033,8 +1185,10 @@ def process_guild_player_message_event(
     config: Dict,
     event: Dict,
 ) -> bool:
-    """Always produce at least one reply when a live
-    session, eligible bot, and functioning LLM exist.
+    """Handle one current player Guild turn.
+
+    Semantically optional casual turns may end in silence
+    before generation; other valid turns produce a reply.
     """
     event_id = _safe_int(event.get('id'))
     extra = parse_extra_data(
@@ -1073,9 +1227,12 @@ def process_guild_player_message_event(
         _mark_event(db, event_id, 'skipped')
         return False
 
-    candidates = _load_candidates(
-        db,
-        _normalize_candidates(extra),
+    candidates = _filter_candidates_by_faction(
+        _load_candidates(
+            db,
+            _normalize_candidates(extra),
+        ),
+        str(extra.get('team') or ''),
     )
     if not candidates:
         _mark_event(db, event_id, 'skipped')
@@ -1095,7 +1252,9 @@ def process_guild_player_message_event(
         'SessionMemory.Enable',
     )
     session_context = (
-        _format_session_context(summary, recent)
+        _format_session_context(
+            summary, recent, get_chatter_mode(config)
+        )
         if memory_enabled
         else ""
     )
@@ -1112,11 +1271,47 @@ def process_guild_player_message_event(
             session_context if memory_enabled else ""
         ),
     )
-    topology, responder_count = _choose_topology(
-        config,
-        len(candidates),
-        bool(addressed.get('multi_addressed')),
+    multi_addressed = bool(
+        addressed.get('multi_addressed')
     )
+    if (
+        memory_enabled
+        and not addressed.get('bot')
+        and not multi_addressed
+    ):
+        continuity_target = _immediately_prior_bot(
+            recent,
+            candidates,
+            player_name,
+            player_message,
+        )
+        if continuity_target:
+            addressed = dict(addressed)
+            addressed['bot'] = continuity_target
+            logger.info(
+                "guild_player_message player=%s "
+                "continuity_target=%s",
+                player_name,
+                continuity_target,
+            )
+    brief_casual = bool(addressed.get('brief_casual'))
+    reply_optional = bool(addressed.get('reply_optional'))
+    if not should_reply_to_optional_casual(config, addressed):
+        logger.info(
+            "guild_player_message player=%s left unanswered "
+            "after optional-casual RNG",
+            player_name,
+        )
+        _mark_event(db, event_id, 'skipped')
+        return False
+    if reply_optional or (brief_casual and not multi_addressed):
+        topology, responder_count = 'single', 1
+    else:
+        topology, responder_count = _choose_topology(
+            config,
+            len(candidates),
+            multi_addressed,
+        )
     responders = _select_responders(
         candidates,
         str(addressed.get('bot') or ''),
@@ -1133,8 +1328,11 @@ def process_guild_player_message_event(
         _mark_event(db, event_id, 'skipped')
         return False
 
+    responders = prepare_guild_speakers(db, client, config, responders)
+
     callback_requested = (
-        memory_enabled
+        not brief_casual
+        and memory_enabled
         and bool(summary or len(recent) > 2)
         and random.randint(1, 100)
         <= _bounded_percent(
@@ -1145,7 +1343,8 @@ def process_guild_player_message_event(
         )
     )
     name_requested = (
-        random.randint(1, 100)
+        not brief_casual
+        and random.randint(1, 100)
         <= _bounded_percent(
             config,
             'LLMChatter.GuildChatter.'
@@ -1154,7 +1353,8 @@ def process_guild_player_message_event(
         )
     )
     question_requested = (
-        random.randint(1, 100)
+        not brief_casual
+        and random.randint(1, 100)
         <= _bounded_percent(
             config,
             'LLMChatter.GuildChatter.'
@@ -1177,6 +1377,8 @@ def process_guild_player_message_event(
         'guild_addressed_bot': (
             addressed.get('bot') or ''
         ),
+        'guild_brief_casual': brief_casual,
+        'guild_reply_optional': reply_optional,
         'guild_callback_requested': callback_requested,
         'guild_player_name_requested': name_requested,
         'guild_question_requested': question_requested,
@@ -1188,6 +1390,19 @@ def process_guild_player_message_event(
         extra.get('guild_name') or 'the guild'
     )
     faction = str(extra.get('team') or '')
+
+    # The guild's conversation thread: replies see what the
+    # guild was talking about (not for brief casual turns),
+    # and the player's line joins it for the next idle line.
+    thread_key = guild_key(extra.get('guild_id'))
+    thread_note = (
+        '' if brief_casual
+        else render_for_player_reply(thread_key, db)
+    )
+    note_player_message(thread_key, player_name, player_message)
+    session_context = '\n'.join(
+        part for part in (session_context, thread_note) if part
+    )
 
     if topology == 'single':
         messages = _generate_single_reply(

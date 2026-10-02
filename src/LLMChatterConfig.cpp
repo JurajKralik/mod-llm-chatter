@@ -5,10 +5,18 @@
 
 #include "LLMChatterConfig.h"
 #include "LLMChatterSimulation.h"
+#include "LLMChatterABScore.h"
 #include "Config.h"
 #include "Log.h"
+#include "SharedDefines.h"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
+#include <limits>
+#include <memory>
+#include <sstream>
+#include <unordered_set>
 
 namespace
 {
@@ -17,6 +25,273 @@ T GetChatterOption(std::string const& name, T const& def)
 {
     return sConfigMgr->GetOption<T>(name, def, false);
 }
+
+char ToLowerAscii(unsigned char value)
+{
+    if (value >= 'A' && value <= 'Z')
+        return static_cast<char>(value + ('a' - 'A'));
+    return static_cast<char>(value);
+}
+
+std::unordered_set<uint32> ParseCreatureEntrySet(
+    std::string const& configured,
+    std::string const& optionName)
+{
+    std::unordered_set<uint32> entries;
+    std::istringstream input(configured);
+    std::string token;
+    while (std::getline(input, token, ','))
+    {
+        auto first = std::find_if_not(
+            token.begin(), token.end(),
+            [](unsigned char value)
+            {
+                return std::isspace(value) != 0;
+            });
+        auto last = std::find_if_not(
+            token.rbegin(), token.rend(),
+            [](unsigned char value)
+            {
+                return std::isspace(value) != 0;
+            }).base();
+        token = first < last
+            ? std::string(first, last) : std::string();
+        if (token.empty())
+            continue;
+
+        bool valid = false;
+        bool digitsOnly = std::all_of(
+            token.begin(), token.end(),
+            [](unsigned char value)
+            {
+                return std::isdigit(value) != 0;
+            });
+        try
+        {
+            unsigned long value = digitsOnly
+                ? std::stoul(token) : 0;
+            if (digitsOnly && value > 0
+                && value <= std::numeric_limits<uint32>::max())
+            {
+                entries.insert(static_cast<uint32>(value));
+                valid = true;
+            }
+        }
+        catch (...)
+        {
+            // Report below while preserving every valid token.
+        }
+
+        if (!valid)
+        {
+            LOG_WARN(
+                "module",
+                "LLMChatter: ignoring invalid creature entry "
+                "'{}' in {}",
+                token, optionName);
+        }
+    }
+    return entries;
+}
+
+template <size_t Size>
+std::array<uint32, Size> ParseDirectedReactorWeights(
+    std::string const& configured,
+    std::array<uint32, Size> const& defaults,
+    char const* optionName,
+    char const* defaultText)
+{
+    std::array<uint32, Size> weights = {};
+    std::istringstream input(configured);
+    std::string token;
+    size_t index = 0;
+    bool valid = true;
+
+    while (std::getline(input, token, ','))
+    {
+        if (index >= weights.size())
+        {
+            valid = false;
+            break;
+        }
+
+        token.erase(
+            token.begin(),
+            std::find_if_not(
+                token.begin(), token.end(),
+                [](unsigned char value)
+                {
+                    return std::isspace(value) != 0;
+                }));
+        token.erase(
+            std::find_if_not(
+                token.rbegin(), token.rend(),
+                [](unsigned char value)
+                {
+                    return std::isspace(value) != 0;
+                }).base(),
+            token.end());
+
+        try
+        {
+            size_t parsed = 0;
+            unsigned long value = std::stoul(token, &parsed);
+            if (parsed != token.size() || value > 100)
+            {
+                valid = false;
+                break;
+            }
+            weights[index++] = static_cast<uint32>(value);
+        }
+        catch (...)
+        {
+            valid = false;
+            break;
+        }
+    }
+
+    uint32 total = 0;
+    bool descending = valid && index == weights.size();
+    for (size_t i = 0; i < weights.size(); ++i)
+    {
+        total += weights[i];
+        if (i > 0 && weights[i - 1] <= weights[i])
+            descending = false;
+    }
+    descending = descending && total == 100;
+    if (!descending)
+    {
+        LOG_WARN(
+            "module",
+            "LLMChatter: {} must contain {} strictly descending "
+            "percentages totaling 100; using {}",
+            optionName, weights.size(), defaultText);
+        return defaults;
+    }
+
+    return weights;
+}
+
+std::unordered_set<std::string> ParseLowerWordSet(
+    std::string const& configured)
+{
+    std::unordered_set<std::string> words;
+    std::istringstream input(configured);
+    std::string token;
+    while (std::getline(input, token, ','))
+    {
+        token.erase(
+            token.begin(),
+            std::find_if_not(
+                token.begin(), token.end(),
+                [](unsigned char value)
+                {
+                    return std::isspace(value) != 0;
+                }));
+        token.erase(
+            std::find_if_not(
+                token.rbegin(), token.rend(),
+                [](unsigned char value)
+                {
+                    return std::isspace(value) != 0;
+                }).base(),
+            token.end());
+        std::transform(
+            token.begin(), token.end(), token.begin(),
+            [](unsigned char value)
+            {
+                return static_cast<char>(std::tolower(value));
+            });
+        if (!token.empty())
+            words.insert(token);
+    }
+    return words;
+}
+
+bool ContainsCreatureEntry(
+    std::shared_ptr<std::unordered_set<uint32> const> const& configured,
+    uint32 creatureEntry)
+{
+    // GCC 11 supports shared_ptr atomic functions, but not atomic<shared_ptr>.
+    auto entries = std::atomic_load(&configured);
+    return creatureEntry > 0 && entries
+        && entries->count(creatureEntry) > 0;
+}
+}
+
+bool LLMChatterConfig::IsProximitySpeakerAllowed(
+    uint32 creatureEntry) const
+{
+    return ContainsCreatureEntry(
+        _proxSpeakerAllowEntries, creatureEntry);
+}
+
+bool LLMChatterConfig::IsProximitySpeakerDenied(
+    uint32 creatureEntry) const
+{
+    return ContainsCreatureEntry(
+        _proxSpeakerDenyEntries, creatureEntry);
+}
+
+bool LLMChatterConfig::IsProximityBossSpeakerDenied(
+    uint32 creatureEntry) const
+{
+    return ContainsCreatureEntry(
+        _proxBossSpeakerDenyEntries, creatureEntry);
+}
+
+bool LLMChatterConfig::IsDirectedNameStopword(
+    std::string const& word) const
+{
+    auto words = std::atomic_load(
+        &_proxDirectedNameStopwords);
+    return words && words->count(word) > 0;
+}
+
+bool LLMChatterConfig::IsCxxScriptedEmoteEntry(
+    uint32 creatureEntry) const
+{
+    return ContainsCreatureEntry(
+        _emoteCxxScriptExclusionEntries,
+        creatureEntry);
+}
+
+bool LLMChatterConfig::IsPlayerChatPrefixIgnored(
+    std::string const& message) const
+{
+    auto prefixes = std::atomic_load(
+        &_playerChatIgnoredPrefixes);
+    if (!prefixes || prefixes->empty())
+        return false;
+
+    size_t start = message.find_first_not_of(
+        " \t\n\r\f\v");
+    if (start == std::string::npos)
+        return false;
+
+    for (std::string const& prefix : *prefixes)
+    {
+        if (message.size() - start < prefix.size())
+            continue;
+
+        bool matches = true;
+        for (size_t index = 0;
+             index < prefix.size(); ++index)
+        {
+            unsigned char value = static_cast<unsigned char>(
+                message[start + index]);
+            if (ToLowerAscii(value) != prefix[index])
+            {
+                matches = false;
+                break;
+            }
+        }
+
+        if (matches)
+            return true;
+    }
+
+    return false;
 }
 
 void LLMChatterConfig::LoadConfig()
@@ -30,12 +305,29 @@ void LLMChatterConfig::LoadConfig()
     _conversationChance = GetChatterOption<uint32>(
         "LLMChatter.ConversationChance", 40);
     _triggerChance = GetChatterOption<uint32>("LLMChatter.TriggerChance", 15);
+    _ambientNpcGossipChance = GetChatterOption<uint32>(
+        "LLMChatter.AmbientNpcGossipChance", 5);
+    _ambientBotGossipChance = GetChatterOption<uint32>(
+        "LLMChatter.AmbientBotGossipChance", 5);
+    _ambientTradeQualityWeightBonus = std::min<uint32>(
+        GetChatterOption<uint32>(
+            "LLMChatter.AmbientTrade.QualityWeightBonus", 4),
+        100);
     _cityChatterMultiplier = GetChatterOption<uint32>("LLMChatter.CityChatterMultiplier", 2);
     _maxPendingRequests = GetChatterOption<uint32>("LLMChatter.MaxPendingRequests", 5);
     _maxBotsPerZone = GetChatterOption<uint32>(
         "LLMChatter.MaxBotsPerZone", 8);
     _maxMessageLength = GetChatterOption<uint32>(
         "LLMChatter.MaxMessageLength", 250);
+    std::string playerChatIgnoredPrefixes =
+        GetChatterOption<std::string>(
+            "LLMChatter.PlayerChat.IgnoredPrefixes", "");
+    auto parsedPlayerChatIgnoredPrefixes =
+        std::make_shared<std::unordered_set<std::string> const>(
+            ParseLowerWordSet(playerChatIgnoredPrefixes));
+    std::atomic_store(
+        &_playerChatIgnoredPrefixes,
+        std::move(parsedPlayerChatIgnoredPrefixes));
 
     // Delivery settings
     _deliveryPollMs = GetChatterOption<uint32>("LLMChatter.DeliveryPollMs", 1000);
@@ -206,7 +498,7 @@ void LLMChatterConfig::LoadConfig()
     _groupKillCooldown = GetChatterOption<uint32>("LLMChatter.GroupChatter.KillCooldown", 120);
     _groupDeathCooldown = GetChatterOption<uint32>("LLMChatter.GroupChatter.DeathCooldown", 30);
     _groupLootCooldown = GetChatterOption<uint32>("LLMChatter.GroupChatter.LootCooldown", 60);
-    _groupPlayerMsgCooldown = GetChatterOption<uint32>("LLMChatter.GroupChatter.PlayerMsgCooldown", 15);
+    _groupPlayerMsgCooldown = GetChatterOption<uint32>("LLMChatter.GroupChatter.PlayerMsgCooldown", 0);
 
     // Group chatter - new event settings
     _groupResurrectChance = GetChatterOption<uint32>("LLMChatter.GroupChatter.ResurrectChance", 100);
@@ -431,6 +723,9 @@ void LLMChatterConfig::LoadConfig()
         GetChatterOption<bool>(
             "LLMChatter.GroupChatter."
             "FacingEnable", true);
+    _actionAsEmote =
+        GetChatterOption<bool>(
+            "LLMChatter.ActionAsEmote.Enable", true);
 
     // Group chatter - state-triggered callouts
     _stateCalloutEnabled = GetChatterOption<bool>(
@@ -453,6 +748,47 @@ void LLMChatterConfig::LoadConfig()
         GetChatterOption<uint32>(
             "LLMChatter.GroupChatter."
             "StateCalloutCooldown", 60);
+
+    // Group chatter - overworld PvP encounters
+    _pvpChatterEnable = GetChatterOption<bool>(
+        "LLMChatter.GroupChatter.PvP.Enable", true);
+    _pvpCombatChance = std::min<uint32>(100,
+        GetChatterOption<uint32>(
+            "LLMChatter.GroupChatter.PvP.CombatChance",
+            60));
+    _pvpKillChance = std::min<uint32>(100,
+        GetChatterOption<uint32>(
+            "LLMChatter.GroupChatter.PvP.KillChance",
+            80));
+    _pvpDeathChance = std::min<uint32>(100,
+        GetChatterOption<uint32>(
+            "LLMChatter.GroupChatter.PvP.DeathChance",
+            60));
+    _pvpCooldown =
+        GetChatterOption<uint32>(
+            "LLMChatter.GroupChatter.PvP.Cooldown", 30);
+    _pvpEnemyCooldown =
+        GetChatterOption<uint32>(
+            "LLMChatter.GroupChatter.PvP.EnemyCooldown",
+            120);
+    _pvpTargetSwitchCallout = GetChatterOption<bool>(
+        "LLMChatter.GroupChatter.PvP."
+        "TargetSwitchCallout", true);
+
+    // Group chatter - duels
+    _duelChatterEnable = GetChatterOption<bool>(
+        "LLMChatter.GroupChatter.Duel.Enable", true);
+    _duelStartChance = std::min<uint32>(100,
+        GetChatterOption<uint32>(
+            "LLMChatter.GroupChatter.Duel.StartChance",
+            60));
+    _duelEndChance = std::min<uint32>(100,
+        GetChatterOption<uint32>(
+            "LLMChatter.GroupChatter.Duel.EndChance",
+            100));
+    _duelCooldown =
+        GetChatterOption<uint32>(
+            "LLMChatter.GroupChatter.Duel.Cooldown", 60);
 
     // Pre-cached instant reactions
     _preCacheEnable = GetChatterOption<bool>(
@@ -501,17 +837,39 @@ void LLMChatterConfig::LoadConfig()
     _useGeneralChatReact = GetChatterOption<bool>(
         "LLMChatter.GeneralChat.PlayerReplyEnable", true);
     _generalChatChance = GetChatterOption<uint32>(
-        "LLMChatter.GeneralChat.ReactionChance", 40);
+        "LLMChatter.GeneralChat.ReactionChance", 100);
     _generalChatQuestionChance = GetChatterOption<uint32>(
-        "LLMChatter.GeneralChat.QuestionChance", 80);
+        "LLMChatter.GeneralChat.QuestionChance", 100);
     _generalChatCooldown = GetChatterOption<uint32>(
-        "LLMChatter.GeneralChat.Cooldown", 30);
+        "LLMChatter.GeneralChat.Cooldown", 0);
     _generalChatConversationChance = GetChatterOption<uint32>(
         "LLMChatter.GeneralChat.ConversationChance", 30);
-    _generalChatHistoryLimit =
+    uint32 chatHistoryLimit = std::clamp(
+        GetChatterOption<uint32>(
+            "LLMChatter.ChatHistoryLimit", 10),
+        1u, 50u);
+    _generalChatHistoryLimit = std::clamp(
         GetChatterOption<uint32>(
             "LLMChatter.GeneralChat.HistoryLimit",
-            15);
+            chatHistoryLimit),
+        1u, 50u);
+
+    _generalLootEnable = GetChatterOption<bool>(
+        "LLMChatter.GeneralLoot.Enable", true);
+    _generalLootAggregationDelayMs = std::max<uint32>(
+        100,
+        GetChatterOption<uint32>(
+            "LLMChatter.GeneralLoot."
+            "AggregationDelayMilliseconds",
+            2500));
+    _generalLootZoneCooldownSeconds =
+        GetChatterOption<uint32>(
+            "LLMChatter.GeneralLoot.ZoneCooldownSeconds",
+            180);
+    _generalLootMinQuality = std::min<uint32>(
+        GetChatterOption<uint32>(
+            "LLMChatter.GeneralLoot.MinQuality", 2),
+        MAX_ITEM_QUALITY - 1);
 
     // RP enrichment
     _raceLoreChance = GetChatterOption<uint32>("LLMChatter.RaceLoreChance", 20);
@@ -537,6 +895,34 @@ void LLMChatterConfig::LoadConfig()
         GetChatterOption<uint32>(
             "LLMChatter.BGChatter."
             "BigEventCooldownSec", 15);
+    _bgABTransitionMaxGapMs = GetChatterOption<uint32>(
+        "LLMChatter.BGChatter.AB.TransitionMaxGapMs", 2000);
+    _bgABNodeBatchCooldownSec = std::clamp<uint32>(GetChatterOption<uint32>(
+        "LLMChatter.BGChatter.AB.NodeBatchCooldownSec", 15), 1, 300);
+    _bgABPendingMaxAgeSec = std::clamp<uint32>(GetChatterOption<uint32>(
+        "LLMChatter.BGChatter.AB.PendingMaxAgeSec", 30), 1, 300);
+    _bgABMaxNodesPerBatch = std::clamp<uint32>(GetChatterOption<uint32>(
+        "LLMChatter.BGChatter.AB.MaxNodesPerBatch", 3), 1, 5);
+    _bgABScoreMilestonePercents = LLMChatterAB::ParseMilestonePercents(
+        GetChatterOption<std::string>(
+            "LLMChatter.BGChatter.AB.ScoreMilestonePercents", "30,60,90"));
+    _bgABScoreCooldownSec = std::clamp<uint32>(GetChatterOption<uint32>(
+        "LLMChatter.BGChatter.AB.ScoreCooldownSec", 30), 1, 300);
+    _bgABObjectiveStatusIntervalSec = std::min<uint32>(GetChatterOption<uint32>(
+        "LLMChatter.BGChatter.AB.ObjectiveStatusIntervalSec", 60), 3600);
+    _bgABObjectiveStatusChance = std::min<uint32>(GetChatterOption<uint32>(
+        "LLMChatter.BGChatter.AB.ObjectiveStatusChance", 50), 100);
+    _bgABEnable = GetChatterOption<bool>(
+        "LLMChatter.BGChatter.AB.Enable", true);
+    _bgFactualMaxAgeSec = std::clamp<uint32>(GetChatterOption<uint32>(
+        "LLMChatter.BGChatter.FactualMaxAgeSec", 30), 1, 300);
+    _bgABFactualMaxAgeSec = std::clamp<uint32>(GetChatterOption<uint32>(
+        "LLMChatter.BGChatter.AB.FactualMaxAgeSec", 45), 1, 300);
+    _bgMatchEndMaxAgeSec = std::clamp<uint32>(GetChatterOption<uint32>(
+        "LLMChatter.BGChatter.MatchEndMaxAgeSec", 45), 1, 300);
+    _bgABTimerEstimateMaxUncertaintySec = std::min<uint32>(
+        GetChatterOption<uint32>(
+            "LLMChatter.BGChatter.AB.TimerEstimateMaxUncertaintySec", 3), 60);
     _bgIdleChatterChance =
         GetChatterOption<uint32>(
             "LLMChatter.BGChatter."
@@ -545,6 +931,14 @@ void LLMChatterConfig::LoadConfig()
         GetChatterOption<uint32>(
             "LLMChatter.BGChatter."
             "IdleChatterCooldownSec", 30);
+    _bgFlagCarryChatterIntervalSec =
+        GetChatterOption<uint32>(
+            "LLMChatter.BGChatter."
+            "FlagCarryChatterIntervalSec", 45);
+    _bgFlagCarryChatterChance =
+        GetChatterOption<uint32>(
+            "LLMChatter.BGChatter."
+            "FlagCarryChatterChance", 50);
     _bgRezChance =
         GetChatterOption<uint32>(
             "LLMChatter.BGChatter."
@@ -615,7 +1009,7 @@ void LLMChatterConfig::LoadConfig()
         std::min(
             GetChatterOption<uint32>(
                 "LLMChatter.GuildChatter."
-                "PlayerReplies.DebounceSeconds", 2),
+                "PlayerReplies.DebounceSeconds", 1),
             10u);
     _guildPlayerIdleSuppressionSeconds =
         GetChatterOption<uint32>(
@@ -690,15 +1084,33 @@ void LLMChatterConfig::LoadConfig()
     _proxChatterEnable =
         GetChatterOption<bool>(
             "LLMChatter.ProximityChatter.Enable",
-            false);
+            true);
+    _proxChatterEnableInDungeons =
+        GetChatterOption<bool>(
+            "LLMChatter.ProximityChatter."
+            "EnableInDungeons", true);
+    _proxChatterEnableInRaids =
+        GetChatterOption<bool>(
+            "LLMChatter.ProximityChatter."
+            "EnableInRaids", true);
     _proxChatterScanInterval =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
             "ScanIntervalSeconds", 30);
+    _proxChatterOutdoorScanInterval =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "OutdoorScanIntervalSeconds",
+            _proxChatterScanInterval);
+    _proxChatterInstanceScanInterval =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "InstanceScanIntervalSeconds",
+            _proxChatterScanInterval);
     _proxChatterScanRadius =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
-            "ScanRadius", 80);
+            "ScanRadius", 40);
     _proxChatterPlayerSayScanRadius =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
@@ -706,11 +1118,21 @@ void LLMChatterConfig::LoadConfig()
     _proxChatterChance =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
-            "Chance", 65);
-    _proxChatterEntityCooldown =
+            "Chance", 30);
+    _proxChatterOutdoorChance =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
-            "EntityCooldown", 300);
+            "OutdoorChance", _proxChatterChance);
+    _proxChatterInstanceChance =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "InstanceChance", _proxChatterChance);
+    _proxChatterEntityCooldown =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "EntityCooldown", 1),
+            3u);
     _proxChatterZoneFatigueThreshold =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
@@ -723,6 +1145,51 @@ void LLMChatterConfig::LoadConfig()
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
             "ConversationChance", 40);
+
+    // Proximity chatter - duel and PvP onlookers
+    {
+        auto pct = [](char const* key, uint32 def)
+        {
+            return std::min<uint32>(100,
+                GetChatterOption<uint32>(
+                    std::string("LLMChatter.ProximityChatter."
+                        "FightReactions.") + key, def));
+        };
+        auto secs = [](char const* key, uint32 def)
+        {
+            return GetChatterOption<uint32>(
+                std::string("LLMChatter.ProximityChatter."
+                    "FightReactions.") + key, def);
+        };
+        _proxFightEnable = GetChatterOption<bool>(
+            "LLMChatter.ProximityChatter."
+            "FightReactions.Enable", true);
+        _proxFightDuelChance = pct("DuelChance", 35);
+        _proxFightPvPChance = pct("PvPChance", 25);
+        _proxFightConversationChance =
+            pct("ConversationChance", 35);
+        _proxFightSecondMomentChance =
+            pct("SecondMomentChance", 20);
+        _proxFightThirdMomentChance =
+            pct("ThirdMomentChance", 20);
+        _proxFightChallengeDelaySeconds =
+            secs("ChallengeDelaySeconds", 2);
+        _proxFightMidDelayMinSeconds =
+            secs("MidDelayMinSeconds", 8);
+        _proxFightMidDelayMaxSeconds = std::max(
+            _proxFightMidDelayMinSeconds,
+            secs("MidDelayMaxSeconds", 15));
+        _proxFightPendingExpirySeconds =
+            std::max(1u, secs("PendingExpirySeconds", 30));
+        _proxFightCompletedRetentionSeconds =
+            secs("CompletedRetentionSeconds", 60);
+        _proxFightLineMaxAgeSeconds =
+            secs("LineMaxAgeSeconds", 20);
+        _proxFightSceneCooldownSeconds =
+            secs("SceneCooldownSeconds", 120);
+        _proxFightSceneCellYards = std::max(
+            1u, secs("SceneCellYards", 100));
+    }
     _proxChatterPlayerAddressChance =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
@@ -734,7 +1201,7 @@ void LLMChatterConfig::LoadConfig()
     _proxChatterConversationLineDelay =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
-            "ConversationLineDelay", 4);
+            "ConversationLineDelay", 2);
     _proxChatterReplyWindowSeconds =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
@@ -746,11 +1213,174 @@ void LLMChatterConfig::LoadConfig()
     _proxChatterMaxTokensPerLine =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
-            "MaxTokensPerLine", 40);
+            "MaxTokensPerLine", 120);
     _proxChatterFacingResetDelay =
         GetChatterOption<uint32>(
             "LLMChatter.ProximityChatter."
             "FacingResetDelay", 8);
+    _proxDirectedMaxExtraReactors =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "DirectedMaxExtraReactors", 2),
+            2u);
+    _proxDirectedBotMaxParticipants =
+        std::clamp(
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "DirectedBotMaxParticipants", 3),
+            1u, 3u);
+    _proxDirectedExtraReactorWeights =
+        ParseDirectedReactorWeights(
+            GetChatterOption<std::string>(
+                "LLMChatter.ProximityChatter."
+                "DirectedExtraReactorWeights",
+                "60,30,10,0"),
+            std::array<uint32, 4>{60, 30, 10, 0},
+            "DirectedExtraReactorWeights",
+            "60,30,10,0");
+    _proxDirectedWitnessReactorWeights =
+        ParseDirectedReactorWeights(
+            GetChatterOption<std::string>(
+                "LLMChatter.ProximityChatter."
+                "DirectedWitnessReactorWeights",
+                "70,30"),
+            std::array<uint32, 2>{70, 30},
+            "DirectedWitnessReactorWeights",
+            "70,30");
+    _proxDirectedNPCAsideChance =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "DirectedNPCAsideChance", 35),
+            100u);
+    _proxDirectedMaxLines =
+        std::min(
+            8u,
+            std::max(
+                1u,
+                GetChatterOption<uint32>(
+                    "LLMChatter.ProximityChatter."
+                    "DirectedMaxLines", 5)));
+    _proxDirectedExpirySeconds =
+        std::max(
+            1u,
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "DirectedExpirySeconds", 30));
+    std::string directedNameStopwords =
+        GetChatterOption<std::string>(
+            "LLMChatter.ProximityChatter."
+            "DirectedNameStopwords",
+            "guard,city,mountaineer,innkeeper,vendor,trainer,"
+            "quartermaster,merchant,stablemaster,banker,auctioneer,"
+            "flight,master,officer,captain,stormwind,ironforge,"
+            "orgrimmar,darnassus,undercity,silvermoon,exodar");
+    auto parsedDirectedNameStopwords =
+        std::make_shared<std::unordered_set<std::string> const>(
+            ParseLowerWordSet(directedNameStopwords));
+    std::atomic_store(
+        &_proxDirectedNameStopwords,
+        std::move(parsedDirectedNameStopwords));
+    std::string speakerAllowEntries =
+        GetChatterOption<std::string>(
+            "LLMChatter.ProximityChatter."
+            "SpeakerAllowEntries", "");
+    auto parsedSpeakerAllowEntries =
+        std::make_shared<std::unordered_set<uint32> const>(
+            ParseCreatureEntrySet(
+                speakerAllowEntries,
+                "SpeakerAllowEntries"));
+    std::atomic_store(&_proxSpeakerAllowEntries,
+        std::move(parsedSpeakerAllowEntries));
+    std::string speakerDenyEntries =
+        GetChatterOption<std::string>(
+            "LLMChatter.ProximityChatter."
+            "SpeakerDenyEntries", "");
+    auto parsedSpeakerDenyEntries =
+        std::make_shared<std::unordered_set<uint32> const>(
+            ParseCreatureEntrySet(
+                speakerDenyEntries,
+                "SpeakerDenyEntries"));
+    std::atomic_store(&_proxSpeakerDenyEntries,
+        std::move(parsedSpeakerDenyEntries));
+    _proxBossDialogueEnable =
+        GetChatterOption<bool>(
+            "LLMChatter.ProximityChatter."
+            "EnableBossDialogue", false);
+    _proxBossApproachCheckInterval =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossApproachCheckIntervalSeconds", 2);
+    _proxBossApproachMaxRadius =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossApproachMaxRadius", 80);
+    _proxBossAggroSafetyMargin =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossAggroSafetyMargin", 0);
+    _proxBossInitialDelayMin =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossInitialDelayMinSeconds", 2);
+    _proxBossInitialDelayMax =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossInitialDelayMaxSeconds", 6);
+    _proxBossRepeatDelayMin =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossRepeatDelayMinSeconds", 20);
+    _proxBossRepeatDelayMax =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossRepeatDelayMaxSeconds", 60);
+    _proxBossRepeatChance =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossRepeatChance", 80);
+    _proxBossRepeatChanceDecay =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossRepeatChanceDecayPercent", 50);
+    _proxBossRepeatChanceFloor =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossRepeatChanceFloor", 10);
+    _proxBossUnlimitedAutomaticLines =
+        GetChatterOption<bool>(
+            "LLMChatter.ProximityChatter."
+            "BossUnlimitedAutomaticLines", true);
+    _proxBossMaxAutomaticLines =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossMaxAutomaticLines", 3);
+    _proxBossPresenceReset =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossPresenceResetSeconds", 90);
+    _proxBossDirectedReplyCooldown =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.ProximityChatter."
+                "BossDirectedReplyCooldownSeconds", 1),
+            3u);
+    _proxBossDirectedScanCooldown =
+        GetChatterOption<uint32>(
+            "LLMChatter.ProximityChatter."
+            "BossDirectedScanCooldownSeconds", 1);
+    std::string bossSpeakerDenyEntries =
+        GetChatterOption<std::string>(
+            "LLMChatter.ProximityChatter."
+            "BossSpeakerDenyEntries", "");
+    auto parsedBossSpeakerDenyEntries =
+        std::make_shared<std::unordered_set<uint32> const>(
+            ParseCreatureEntrySet(
+                bossSpeakerDenyEntries,
+                "BossSpeakerDenyEntries"));
+    std::atomic_store(&_proxBossSpeakerDenyEntries,
+        std::move(parsedBossSpeakerDenyEntries));
 
     // Emote reaction system
     _emoteReactionsEnable =
@@ -758,33 +1388,98 @@ void LLMChatterConfig::LoadConfig()
             "LLMChatter.EmoteReactions.Enable",
             true);
     _emoteMirrorChance =
-        GetChatterOption<uint32>(
-            "LLMChatter.EmoteReactions."
-            "MirrorChance", 90);
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "MirrorChance", 80),
+            100u);
     _emoteMirrorCooldown =
         GetChatterOption<uint32>(
             "LLMChatter.EmoteReactions."
             "MirrorCooldown", 15);
     _emoteReactionChance =
-        GetChatterOption<uint32>(
-            "LLMChatter.EmoteReactions."
-            "ReactionChance", 60);
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "ReactionChance", 80),
+            100u);
+    _emoteUngroupedBotMirrorChance =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "UngroupedBotMirrorChance", 80),
+            100u);
+    _emoteUngroupedBotVerbalReactionChance =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "UngroupedBotVerbalReactionChance", 80),
+            100u);
+    _emoteUngroupedBotWitnessReactionChance =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "UngroupedBotWitnessReactionChance", 50),
+            100u);
+    _emotePartyBotWitnessChance =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "PartyBotWitnessChance", 30),
+            100u);
     _emoteObserverChance =
-        GetChatterOption<uint32>(
-            "LLMChatter.EmoteReactions."
-            "ObserverChance", 40);
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "ObserverChance", 50),
+            100u);
     _emoteObserverCooldown =
         GetChatterOption<uint32>(
             "LLMChatter.EmoteReactions."
             "ObserverCooldown", 30);
     _emoteMoodSpreadChance =
-        GetChatterOption<uint32>(
-            "LLMChatter.EmoteReactions."
-            "MoodSpreadChance", 50);
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "MoodSpreadChance", 50),
+            100u);
     _emoteNPCMirrorEnable =
         GetChatterOption<bool>(
             "LLMChatter.EmoteReactions."
             "NPCMirrorEnable", true);
+    _emoteCustomEnable =
+        GetChatterOption<bool>(
+            "LLMChatter.EmoteReactions."
+            "CustomEnable", true);
+    _emoteCustomMaxChars =
+        GetChatterOption<uint32>(
+            "LLMChatter.EmoteReactions."
+            "CustomMaxChars", 120);
+    _emoteNPCVerbalReactionChance =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "NPCVerbalReactionChance", 80),
+            100u);
+    _emoteNPCVerbalCooldown =
+        std::min(
+            GetChatterOption<uint32>(
+                "LLMChatter.EmoteReactions."
+                "NPCVerbalCooldown", 3),
+            3u);
+    std::string cxxScriptExclusionEntries =
+        GetChatterOption<std::string>(
+            "LLMChatter.EmoteReactions."
+            "CxxScriptExclusionEntries",
+            "620,25305,33211,33224,6626,7233,3401");
+    auto parsedCxxScriptExclusionEntries =
+        std::make_shared<std::unordered_set<uint32> const>(
+            ParseCreatureEntrySet(
+                cxxScriptExclusionEntries,
+                "CxxScriptExclusionEntries"));
+    std::atomic_store(
+        &_emoteCxxScriptExclusionEntries,
+        std::move(parsedCxxScriptExclusionEntries));
 
     // The milestone owns supported speech; don't run legacy social producers beside it.
     // These fields are reloaded from their normal config when simulation is disabled.

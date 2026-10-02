@@ -68,7 +68,7 @@ void QueueStateCallout(
 
     std::string targetName = "";
     Unit* victim = bot->GetVictim();
-    if (victim)
+    if (victim && IsUnitPerceivableBy(bot, victim))
         targetName = victim->GetName();
 
     std::string aggroTarget = "";
@@ -79,7 +79,28 @@ void QueueStateCallout(
             victim->GetVictim()->GetName();
     }
 
-    if (sLLMChatterConfig->_preCacheEnable
+    // Fighting an opposing-faction player (or its pet).
+    // Classification does not depend on PvP.Enable: a
+    // PvP fight never falls back to creature framing or
+    // creature caches, it is suppressed instead.
+    PvPEnemyRef pvpEnemy;
+    if (victim)
+    {
+        pvpEnemy.enemy =
+            ResolveOpposingFactionPlayer(bot, victim);
+        pvpEnemy.unit = victim;
+        pvpEnemy.viaPet = pvpEnemy.enemy
+            && victim != pvpEnemy.enemy;
+    }
+    bool isPvP = (pvpEnemy.enemy != nullptr);
+    if (isPvP && !sLLMChatterConfig->_pvpChatterEnable)
+        return;
+    if (isPvP
+        && !IsPvPEnemyPerceivable(bot, victim))
+        targetName = "";
+
+    if (!isPvP
+        && sLLMChatterConfig->_preCacheEnable
         && sLLMChatterConfig
                ->_preCacheStateEnable
         && group)
@@ -133,6 +154,17 @@ void QueueStateCallout(
             JsonEscape(targetName) + "\","
         "\"aggro_target\":\"" +
             JsonEscape(aggroTarget) + "\","
+        + (isPvP
+            ? BuildPvPEnemyFields(
+                bot, bot, pvpEnemy,
+                DetectPvPInitiator(
+                    bot, pvpEnemy.enemy))
+                + (std::string(eventType)
+                        == "bot_group_aggro_loss"
+                    ? ",\"callout_kind\":"
+                      "\"pvp_target_switch\","
+                    : ",")
+            : std::string())
         + BuildBotStateJson(bot) + "}";
 
     if (bot->InBattleground())
@@ -203,12 +235,7 @@ void HandleGroupCreatureKillImpl(
         return;
 
     uint32 rank = tmpl->rank;
-    bool isBoss = (rank == 3)
-        || (tmpl->type_flags
-            & CREATURE_TYPE_FLAG_BOSS_MOB)
-        || killed->IsDungeonBoss()
-        || _namedBossEntries.count(
-            killed->GetEntry());
+    bool isBoss = IsLLMChatterBoss(killed);
     bool isRare = (rank == 2 || rank == 4);
     bool isNormal = !isBoss && !isRare;
 
@@ -291,6 +318,11 @@ void HandleGroupPlayerKilledByCreatureImpl(
     if (!killed)
         return;
 
+    // A pet owned by an opposing-faction player is
+    // overworld PvP, not a creature kill.
+    if (HandleGroupPetPvPKill(killer, killed))
+        return;
+
     Group* group = killed->GetGroup();
     if (!group)
         return;
@@ -298,9 +330,62 @@ void HandleGroupPlayerKilledByCreatureImpl(
     if (!GroupHasRealPlayer(group))
         return;
 
+    // In a BG, player pets/totems fall through the PvP
+    // path above. Name the owner so the prompt doesn't
+    // treat a pet called "Cat" as the enemy player
+    // ("Wulobe's Cat", "Majir's Searing Totem").
+    std::string killerName =
+        killer ? killer->GetName() : "";
+    if (killer)
+    {
+        Player* owner = killer
+            ->GetCharmerOrOwnerPlayerOrPlayerItself();
+        if (owner && owner != killed)
+            killerName = owner->GetName() + "'s "
+                + killer->GetName();
+    }
+
+    QueueGroupDeathOrWipe(
+        killed, group,
+        killerName,
+        killer ? killer->GetEntry() : 0,
+        nullptr);
+}
+
+void QueueGroupDeathOrWipe(
+    Player* killed, Group* group,
+    std::string const& creatureKillerName,
+    uint32 killerEntry,
+    PvPEnemyRef const* pvpEnemy)
+{
+    if (!killed || !group)
+        return;
+
     uint32 groupId =
         group->GetGUID().GetCounter();
     time_t now = time(nullptr);
+
+    // Killer name as the reactor may know it. PvP names
+    // pass the identity visibility gate first.
+    auto killerNameFor =
+        [&](Player* reactor) -> std::string
+    {
+        if (pvpEnemy)
+            return GetPerceivedPvPEnemyName(
+                reactor, *pvpEnemy);
+        return creatureKillerName;
+    };
+    auto pvpFieldsFor =
+        [&](Player* reactor) -> std::string
+    {
+        if (!pvpEnemy)
+            return "";
+        return BuildPvPEnemyFields(
+            reactor, killed, *pvpEnemy,
+            DetectPvPInitiator(
+                killed, pvpEnemy->enemy))
+            + ",";
+    };
 
     {
         bool allDead = true;
@@ -348,8 +433,15 @@ void HandleGroupPlayerKilledByCreatureImpl(
             _groupWipeCooldowns[groupId] =
                 now;
 
-            Player* wipeReactor =
-                GetRandomBotInGroup(group);
+            // Everyone is dead, so the reactor must
+            // not be required to be alive. Party
+            // delivery accepts a dead speaker.
+            Player* wipeReactor = pvpEnemy
+                ? SelectPvPReactor(
+                    group, nullptr,
+                    pvpEnemy->unit, false)
+                : GetRandomBotInGroup(
+                    group, nullptr, false);
             if (!wipeReactor)
                 return;
 
@@ -359,13 +451,7 @@ void HandleGroupPlayerKilledByCreatureImpl(
             std::string wrName =
                 wipeReactor->GetName();
             std::string kName =
-                killer
-                    ? killer->GetName()
-                    : "";
-            uint32 kEntry =
-                killer
-                    ? killer->GetEntry()
-                    : 0;
+                killerNameFor(wipeReactor);
 
             std::string wipeData = "{"
                 + BuildBotIdentityFields(
@@ -378,7 +464,8 @@ void HandleGroupPlayerKilledByCreatureImpl(
                         kName) + "\","
                 "\"killer_entry\":" +
                     std::to_string(
-                        kEntry) + ","
+                        killerEntry) + ","
+                + pvpFieldsFor(wipeReactor)
                 + BuildBotStateJson(wipeReactor)
                 + "}";
 
@@ -397,7 +484,7 @@ void HandleGroupPlayerKilledByCreatureImpl(
                 wrName,
                 0,
                 kName,
-                kEntry,
+                killerEntry,
                 wipeData,
                 GetReactionDelaySeconds(
                     "bot_group_wipe"),
@@ -416,16 +503,30 @@ void HandleGroupPlayerKilledByCreatureImpl(
                ->_groupDeathCooldown)
         return;
 
-    if (urand(1, 100)
-        > sLLMChatterConfig->_groupDeathChance)
+    uint32 deathChance = pvpEnemy
+        ? sLLMChatterConfig->_pvpDeathChance
+        : sLLMChatterConfig->_groupDeathChance;
+    if (urand(1, 100) > deathChance)
+        return;
+
+    Player* reactor = pvpEnemy
+        ? SelectPvPReactor(
+            group, killed, pvpEnemy->unit, true)
+        : GetRandomBotInGroup(group, killed);
+    if (!reactor)
+        return;
+
+    if (pvpEnemy
+        && !TryConsumePvPCooldown(
+            groupId,
+            pvpEnemy->enemy
+                ? pvpEnemy->enemy->GetGUID()
+                      .GetCounter()
+                : 0,
+            PvPEventKind::Death, now))
         return;
 
     _groupDeathCooldowns[groupId] = now;
-
-    Player* reactor = GetRandomBotInGroup(
-        group, killed);
-    if (!reactor)
-        return;
 
     uint32 reactorGuid =
         reactor->GetGUID().GetCounter();
@@ -439,9 +540,7 @@ void HandleGroupPlayerKilledByCreatureImpl(
     std::string deadName =
         killed->GetName();
     std::string killerName =
-        killer ? killer->GetName() : "";
-    uint32 killerEntry =
-        killer ? killer->GetEntry() : 0;
+        killerNameFor(reactor);
 
     std::string extraData = "{"
         + BuildBotIdentityFields(reactor) + ","
@@ -459,6 +558,7 @@ void HandleGroupPlayerKilledByCreatureImpl(
             std::string(
                 isPlayerDeath
                     ? "true" : "false") + ","
+        + pvpFieldsFor(reactor)
         + BuildBotStateJson(reactor) + "}";
 
     if (reactor->InBattleground())
@@ -648,6 +748,11 @@ void HandleGroupPlayerEnterCombatImpl(
     if (!player || !enemy)
         return;
 
+    // Opposing-faction players (and their pets) take the
+    // PvP path, including when the real player engages.
+    if (HandleGroupPvPEnterCombat(player, enemy))
+        return;
+
     if (!IsPlayerBot(player))
         return;
 
@@ -668,9 +773,9 @@ void HandleGroupPlayerEnterCombatImpl(
         return;
 
     uint32 rank = tmpl->rank;
-    bool isBoss = (rank == 3)
-        || (tmpl->type_flags
-            & CREATURE_TYPE_FLAG_BOSS_MOB);
+    // Same boss test as kill reactions, so dungeon
+    // encounter bosses (elite rank) count as bosses.
+    bool isBoss = IsLLMChatterBoss(creature);
     bool isElite = (rank >= 1);
     bool isNormal = !isBoss && !isElite;
 
@@ -797,6 +902,16 @@ void HandleGroupPlayerBeforeSendChatMessageImpl(
     if (SimulationEnabled())
         return;
 
+    // /e and /me arrive here as CHAT_MSG_EMOTE rather than
+    // through the OnPlayerTextEmote hook, which only fires
+    // for the ~244 named emotes.
+    if (type == CHAT_MSG_EMOTE)
+    {
+        if (lang != LANG_ADDON)
+            HandleGroupPlayerCustomEmoteImpl(player, msg);
+        return;
+    }
+
     if (type != CHAT_MSG_PARTY
         && type != CHAT_MSG_PARTY_LEADER)
         return;
@@ -881,7 +996,9 @@ void HandleGroupPlayerBeforeSendChatMessageImpl(
     {
         if (Player* member = itr->GetSource())
         {
-            if (IsPlayerBot(member))
+            if (IsPlayerBot(member)
+                && member->GetTeamId()
+                    == player->GetTeamId())
             {
                 hasBotInGroup = true;
                 break;
@@ -914,6 +1031,10 @@ void HandleGroupPlayerBeforeSendChatMessageImpl(
     // Normalization can strip an all-invalid payload
     // (e.g. \xFF\xFF...) down to empty — drop it.
     if (safeMsg.empty())
+        return;
+
+    if (sLLMChatterConfig
+            ->IsPlayerChatPrefixIgnored(safeMsg))
         return;
 
     if (IsLikelyPlayerbotControlCommand(
@@ -952,6 +1073,10 @@ void HandleGroupPlayerBeforeSendChatMessageImpl(
         "\"group_id\":" +
             std::to_string(groupId) +
         "}";
+
+    if (Battleground* bg = player->GetBattleground())
+        if (bg->isBattleground())
+            AppendBGContext(bg, player, extraData);
 
     extraData = EscapeString(extraData);
 
@@ -1697,6 +1822,10 @@ void HandleGroupPlayerSpellCastImpl(
         (spellCategory == "offensive"
          || spellCategory == "cc");
 
+    // The unit whose name becomes target_name. PvP
+    // identity is resolved from this same unit so the
+    // name and the enemy fields can never disagree.
+    Unit* targetUnit = nullptr;
     if (isAreaBuff)
     {
         targetName = "the group";
@@ -1707,18 +1836,59 @@ void HandleGroupPlayerSpellCastImpl(
                         != player->GetGUID()))
     {
         targetName = spellTarget->GetName();
+        targetUnit = spellTarget;
     }
     if (targetName.empty()
         && preferVictimTarget)
     {
         Unit* victim = player->GetVictim();
         if (victim)
+        {
             targetName = victim->GetName();
+            targetUnit = victim;
+        }
     }
 
     if (preferVictimTarget
         && targetName.empty())
         return;
+
+    PvPEnemyRef pvpEnemy;
+    if (preferVictimTarget && targetUnit)
+    {
+        pvpEnemy.enemy =
+            ResolveOpposingFactionPlayer(
+                player, targetUnit);
+        pvpEnemy.unit = targetUnit;
+        pvpEnemy.viaPet = pvpEnemy.enemy
+            && targetUnit != pvpEnemy.enemy;
+    }
+    bool isPvPTarget = (pvpEnemy.enemy != nullptr);
+    if (isPvPTarget)
+    {
+        if (!sLLMChatterConfig->_pvpChatterEnable)
+            return;
+
+        // A bot caster reacts to its own spell; for the
+        // real player, pick a bot in the same scene.
+        if (!casterIsBot)
+        {
+            reactor = SelectPvPReactor(
+                group, nullptr, targetUnit, true);
+            if (!reactor)
+                return;
+            botGuid =
+                reactor->GetGUID().GetCounter();
+            botName = reactor->GetName();
+        }
+
+        // target_name stays the unit that was hit: the
+        // pet itself for a pet target, else the player.
+        if (IsPvPEnemyPerceivable(reactor, targetUnit))
+            targetName = targetUnit->GetName();
+        else
+            targetName = "an unseen enemy";
+    }
 
     bool isSelfCast = (!preferVictimTarget
         && !isAreaBuff
@@ -1742,6 +1912,9 @@ void HandleGroupPlayerSpellCastImpl(
         if (!casterIsBot)
             canUseCache = false;
     }
+    // Cached lines are written for creature enemies.
+    if (isPvPTarget)
+        canUseCache = false;
 
     if (spellCategory != "resurrect"
         && canUseCache
@@ -1786,6 +1959,13 @@ void HandleGroupPlayerSpellCastImpl(
             JsonEscape(targetName) + "\","
         "\"group_id\":" +
             std::to_string(groupId) + ","
+        + (isPvPTarget
+            ? BuildPvPEnemyFields(
+                reactor, player, pvpEnemy,
+                DetectPvPInitiator(
+                    player, pvpEnemy.enemy))
+                + ","
+            : std::string())
         + BuildBotStateJson(reactor) + "}";
 
     if (reactor->InBattleground())
@@ -2120,24 +2300,97 @@ void HandleGroupPlayerMapChangedImpl(
         return;
 }
 
-void HandleGroupPlayerTextEmoteImpl(
-    Player* player, uint32 textEmote,
-    ObjectGuid guid)
+/// Normalise a player-typed /e or /me before it is handed to
+/// the LLM: strip control characters, collapse runs of
+/// whitespace and clamp the length. Returns an empty string
+/// for anything too short to be a real action.
+static std::string SanitizeCustomEmote(
+    std::string const& raw, uint32 maxChars)
 {
+    std::string out;
+    out.reserve(raw.size());
+
+    bool pendingSpace = false;
+    for (unsigned char c : raw)
+    {
+        if (c < 0x20 || c == 0x7F)
+        {
+            pendingSpace = !out.empty();
+            continue;
+        }
+        if (c == ' ')
+        {
+            pendingSpace = !out.empty();
+            continue;
+        }
+        if (pendingSpace)
+        {
+            out.push_back(' ');
+            pendingSpace = false;
+        }
+        out.push_back(static_cast<char>(c));
+    }
+
+    out = SanitizeUtf8(out);
+
+    // maxChars counts characters, not bytes, so non-ASCII text
+    // gets the full configured length. A character starts at
+    // every byte that is not a 10xxxxxx continuation byte, so
+    // cutting at the start of character maxChars + 1 never
+    // severs a multi-byte sequence.
+    size_t chars = 0;
+    for (size_t i = 0; i < out.size(); ++i)
+    {
+        if ((static_cast<unsigned char>(out[i]) & 0xC0)
+            == 0x80)
+            continue;
+        if (chars == maxChars)
+        {
+            out.resize(i);
+            break;
+        }
+        ++chars;
+    }
+
+    if (chars < 2)
+        return "";
+
+    return out;
+}
+
+/// Shared body for named (/point) and free-text (/e) emotes.
+///
+/// customText is empty for a named emote, in which case
+/// textEmote identifies it. For a free-text emote there is no
+/// id, so textEmote is 0 and only verbal reactions are
+/// possible — nothing can be mirrored.
+static void DispatchPlayerEmote(
+    Player* player, uint32 textEmote,
+    ObjectGuid guid,
+    std::string const& customText)
+{
+    bool const isCustom = !customText.empty();
+
     if (!player)
         return;
 
     if (IsPlayerBot(player))
         return;
 
-    if (s_ignoredEmotes.count(textEmote))
-        return;
-    if (s_combatCalloutEmotes.count(textEmote))
-        return;
+    if (!isCustom)
+    {
+        if (s_ignoredEmotes.count(textEmote))
+            return;
+        if (s_combatCalloutEmotes.count(textEmote))
+            return;
+    }
     if (!sLLMChatterConfig
         || !sLLMChatterConfig->IsEnabled())
         return;
     if (!sLLMChatterConfig->_emoteReactionsEnable)
+        return;
+    if (isCustom
+        && !sLLMChatterConfig->_emoteCustomEnable)
         return;
 
     Group* group = player->GetGroup();
@@ -2148,6 +2401,8 @@ void HandleGroupPlayerTextEmoteImpl(
     uint32 npcType = 0;
     Player* cachedTargetPlayer = nullptr;
     Creature* cachedTargetCreature = nullptr;
+    bool creatureEmoteScripted = false;
+    bool ungroupedBotDirectAccepted = false;
 
     if (!guid.IsEmpty())
     {
@@ -2159,10 +2414,13 @@ void HandleGroupPlayerTextEmoteImpl(
             {
                 cachedTargetPlayer = tgt;
                 targetName = tgt->GetName();
-                if (tgt->GetGroup() == group)
-                    tgtType = IsPlayerBot(tgt)
+                if (IsPlayerBot(tgt))
+                    tgtType = group
+                        && tgt->GetGroup() == group
                         ? EMOTE_TGT_GROUP_BOT
-                        : EMOTE_TGT_GROUP_PLAYER;
+                        : EMOTE_TGT_UNGROUPED_BOT;
+                else if (group && tgt->GetGroup() == group)
+                    tgtType = EMOTE_TGT_GROUP_PLAYER;
                 else
                     tgtType =
                         EMOTE_TGT_EXT_PLAYER;
@@ -2184,15 +2442,19 @@ void HandleGroupPlayerTextEmoteImpl(
                 npcType =
                     npc->GetCreatureTemplate()
                         ->type;
+                creatureEmoteScripted =
+                    IsCreatureEmoteScripted(
+                        npc, textEmote);
             }
         }
     }
 
     if (sLLMChatterConfig->IsDebugLog())
         LOG_DEBUG("module",
-            "LLMChatter: TextEmote {} "
+            "LLMChatter: TextEmote {} custom='{}' "
             "tgtType={} target='{}'",
             textEmote,
+            customText,
             static_cast<int>(tgtType),
             targetName);
 
@@ -2201,12 +2463,47 @@ void HandleGroupPlayerTextEmoteImpl(
     // the player is solo or has no nearby bot audience.
     // They are governed by EmoteReactions.Enable only —
     // NOT GroupChatter.Enable — because no party/raid
-    // output is involved.
-    if (tgtType == EMOTE_TGT_CREATURE
-        && cachedTargetCreature)
-        HandleEmoteAtCreature(
+    // output is involved. A custom emote has no animation
+    // to mirror, so this stays named-emote only.
+    if (!isCustom
+        && tgtType == EMOTE_TGT_CREATURE
+        && cachedTargetCreature
+        && !creatureEmoteScripted)
+    {
+        uint32 mirrorEmote = HandleEmoteAtCreature(
             player, cachedTargetCreature,
             textEmote);
+        HandleProximityPlayerEmote(
+            player, cachedTargetCreature,
+            textEmote, mirrorEmote);
+    }
+
+    if (tgtType == EMOTE_TGT_UNGROUPED_BOT
+        && cachedTargetPlayer)
+    {
+        float radius = static_cast<float>(
+            sLLMChatterConfig
+                ->_proxChatterPlayerSayScanRadius);
+        // A custom emote has no animation to mirror, so only
+        // the verbal proximity route can accept it.
+        ungroupedBotDirectAccepted =
+            IsProximityDirectedPlayerbotEligible(
+                player, cachedTargetPlayer, radius)
+            && ((!isCustom
+                    && HasPlayerbotMirrorEmote(textEmote))
+                || IsProximityPlayerbotEmoteRouteEnabled());
+        if (ungroupedBotDirectAccepted)
+        {
+            uint32 mirrorEmote = isCustom
+                ? 0
+                : HandleEmoteAtUngroupedBot(
+                      player, cachedTargetPlayer,
+                      textEmote);
+            HandleProximityPlayerbotEmote(
+                player, cachedTargetPlayer,
+                textEmote, mirrorEmote, customText);
+        }
+    }
 
     if (!group || !GroupHasRealPlayer(group))
         return;
@@ -2236,9 +2533,48 @@ void HandleGroupPlayerTextEmoteImpl(
     {
         case EMOTE_TGT_GROUP_BOT:
             if (cachedTargetPlayer)
+            {
                 HandleEmoteAtGroupBot(
                     player, cachedTargetPlayer,
-                    textEmote, group);
+                    textEmote, group, customText);
+
+                // The rest of the party notices too: other
+                // nearby bots may comment, contagious emotes
+                // may spread, and nearby non-party bots/NPCs
+                // may witness it in /say.
+                std::vector<Player*> others;
+                for (Player* bot : nearbyAliveBots)
+                    if (bot != cachedTargetPlayer)
+                        others.push_back(bot);
+                if (!player->IsInCombat())
+                {
+                    if (!others.empty())
+                        HandleEmoteObserver(
+                            player, textEmote, group,
+                            EMOTE_TGT_GROUP_BOT,
+                            targetName, 0u, 0u, 0u, "",
+                            others, customText,
+                            cachedTargetPlayer);
+                    HandleProximityPartyBotEmoteWitness(
+                        player, cachedTargetPlayer,
+                        textEmote, customText);
+                }
+                if (!isCustom)
+                    HandleEmoteMoodSpread(
+                        player, textEmote, others);
+            }
+            break;
+        case EMOTE_TGT_UNGROUPED_BOT:
+            if (!ungroupedBotDirectAccepted
+                && !player->IsInCombat())
+            {
+                HandleEmoteObserver(
+                    player, textEmote, group,
+                    EMOTE_TGT_EXT_PLAYER,
+                    targetName, npcRank, npcType,
+                    0u, "", nearbyAliveBots, customText,
+                    cachedTargetPlayer);
+            }
             break;
         case EMOTE_TGT_CREATURE:
             if (!player->IsInCombat())
@@ -2255,7 +2591,7 @@ void HandleGroupPlayerTextEmoteImpl(
                               ->GetCreatureTemplate()
                               ->SubName
                         : "",
-                    nearbyAliveBots);
+                    nearbyAliveBots, customText);
             break;
         case EMOTE_TGT_EXT_PLAYER:
         case EMOTE_TGT_NONE:
@@ -2265,11 +2601,42 @@ void HandleGroupPlayerTextEmoteImpl(
                     tgtType, targetName,
                     npcRank, npcType,
                     0u, "",
-                    nearbyAliveBots);
+                    nearbyAliveBots, customText,
+                    cachedTargetPlayer);
+            // An undirected cheer or dance can spread too.
+            if (tgtType == EMOTE_TGT_NONE && !isCustom)
+                HandleEmoteMoodSpread(
+                    player, textEmote, nearbyAliveBots);
             break;
         case EMOTE_TGT_GROUP_PLAYER:
             break;
     }
+}
+
+void HandleGroupPlayerTextEmoteImpl(
+    Player* player, uint32 textEmote,
+    ObjectGuid guid)
+{
+    DispatchPlayerEmote(player, textEmote, guid, "");
+}
+
+void HandleGroupPlayerCustomEmoteImpl(
+    Player* player, std::string const& text)
+{
+    if (!player || !sLLMChatterConfig)
+        return;
+
+    std::string action = SanitizeCustomEmote(
+        text, sLLMChatterConfig->_emoteCustomMaxChars);
+    if (action.empty())
+        return;
+
+    // A free-text emote carries no target in the packet the
+    // way /point does, so fall back to what the player has
+    // selected. That matches how a person reads the emote:
+    // "/e grabs hand" while targeting a bot is aimed at it.
+    DispatchPlayerEmote(
+        player, 0, player->GetTarget(), action);
 }
 
 void HandleGroupPlayerUpdateZoneImpl(
@@ -2553,7 +2920,18 @@ void CheckGroupCombatStateImpl()
                         Player* threatened =
                             victim->GetVictim()
                                 ->ToPlayer();
+                        // Players have no threat: an
+                        // enemy player switching targets
+                        // is its own optional callout.
+                        bool pvpSwitchMuted =
+                            ResolveOpposingFactionPlayer(
+                                bot, victim)
+                            && (!sLLMChatterConfig
+                                    ->_pvpChatterEnable
+                                || !sLLMChatterConfig
+                                    ->_pvpTargetSwitchCallout);
                         if (threatened
+                            && !pvpSwitchMuted
                             && group->IsMember(
                                 threatened
                                     ->GetGUID()))

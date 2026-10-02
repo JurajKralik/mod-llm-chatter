@@ -41,6 +41,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         producer='LLMChatterGroup.cpp',
         description='Bot reacts to creature kill',
         payload_fields={
+            'ab_state': (dict, False),
             'creature_name': (str, True),
             'creature_entry': (int, True),
             'is_boss': (int, False),
@@ -70,6 +71,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         priority='critical',
         description='Bot reacts to combat start',
         payload_fields={
+            'ab_state': (dict, False),
             'creature_name': (str, True),
             'creature_entry': (int, True),
             'is_boss': (str, False),
@@ -86,6 +88,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
             'Bot reacts to party member death'
         ),
         payload_fields={
+            'ab_state': (dict, False),
             'dead_name': (str, True),
             'dead_guid': (int, True),
             'killer_name': (str, False),
@@ -150,6 +153,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         producer='LLMChatterGroup.cpp',
         description='Bot reacts to achievement',
         payload_fields={
+            'ab_state': (dict, False),
             'achiever_name': (str, True),
             'achievement_name': (str, True),
             'achievement_id': (int, True),
@@ -166,6 +170,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         priority='critical',
         description='Bot reacts to spell cast',
         payload_fields={
+            'ab_state': (dict, False),
             'caster_name': (str, True),
             'spell_name': (str, True),
             'spell_category': (str, True),
@@ -275,6 +280,35 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         },
     ),
 
+    # -- Duel events (chatter_duel) ---------------
+
+    'bot_group_duel_start': EventSpec(
+        handler_module='chatter_duel',
+        handler_func='process_duel_start_event',
+        producer='LLMChatterDuel.cpp',
+        priority='high',
+        description='Bot reacts to a duel starting',
+        payload_fields={
+            'duellist_a_name': (str, True),
+            'duellist_b_name': (str, True),
+            'reactor_role': (str, True),
+        },
+    ),
+
+    'bot_group_duel_end': EventSpec(
+        handler_module='chatter_duel',
+        handler_func='process_duel_end_event',
+        producer='LLMChatterDuel.cpp',
+        priority='high',
+        description='Bot reacts to a duel result',
+        payload_fields={
+            'winner_name': (str, True),
+            'loser_name': (str, True),
+            'outcome': (str, True),
+            'reactor_role': (str, True),
+        },
+    ),
+
     'bot_group_corpse_run': EventSpec(
         handler_module='chatter_group_handlers',
         handler_func=(
@@ -370,14 +404,18 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
     'bot_group_emote_reaction': EventSpec(
         handler_module='chatter_emote_reaction',
         handler_func='handle_emote_reaction',
-        producer='LLMChatterGroup.cpp',
+        producer='LLMChatterGroupEmote.cpp',
         description=(
             'Bot reacts to directed emote'
         ),
         payload_fields={
             'emote_name': (str, True),
+            'mirror_emote': (str, False),
             'player_name': (str, True),
             'directed': (int, True),
+            # 1 when emote_name is free text from /e or /me
+            # rather than one of the named emotes.
+            'custom_emote': (int, False),
         },
     ),
 
@@ -396,6 +434,15 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
             'npc_rank': (int, False),
             'npc_type': (int, False),
             'npc_subname': (str, False),
+            # 1 when emote_name is free text from /e or /me
+            # rather than one of the named emotes.
+            'custom_emote': (int, False),
+            # Only sent when the target is a player, so the
+            # observer can describe who was pointed at.
+            'target_race': (int, False),
+            'target_class': (int, False),
+            'target_level': (int, False),
+            'target_gender': (int, False),
         },
     ),
 
@@ -446,6 +493,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
             'Multiple bots join group at once'
         ),
         payload_fields={
+            'ab_state': (dict, False),
             'player_name': (str, True),
             'player_guid': (int, False),
             'zone': (int, True),
@@ -466,6 +514,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
             'Bot responds to player party message'
         ),
         payload_fields={
+            'ab_state': (dict, False),
             'player_name': (str, True),
             'player_message': (str, True),
         },
@@ -547,6 +596,12 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         payload_fields={
             'player_guid': (int, True),
             'zone_name': (str, True),
+            'subzone_name': (str, False),
+            'map_id': (int, False),
+            'instance_id': (int, False),
+            'map_name': (str, False),
+            'is_dungeon': (bool, False),
+            'is_raid': (bool, False),
             'participants': (list, True),
         },
     ),
@@ -560,6 +615,12 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         payload_fields={
             'player_guid': (int, True),
             'zone_name': (str, True),
+            'subzone_name': (str, False),
+            'map_id': (int, False),
+            'instance_id': (int, False),
+            'map_name': (str, False),
+            'is_dungeon': (bool, False),
+            'is_raid': (bool, False),
             'participants': (list, True),
             'max_lines': (int, True),
         },
@@ -569,12 +630,26 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         handler_module='chatter_proximity',
         handler_func='handle_proximity_reply',
         producer='LLMChatterProximity.cpp',
-        priority='normal',
+        priority='high',
         description='Reply to player /say near active scene',
         payload_fields={
             'player_guid': (int, True),
             'player_message': (str, True),
             'responder_name': (str, True),
+            'responder_is_npc': (bool, False),
+            'responder_npc_entry': (int, False),
+            'responder_npc_spawn_id': (int, False),
+            'responder_role': (str, False),
+            'responder_sub_name': (str, False),
+            'responder_disposition': (str, False),
+            'responder_rank': (str, False),
+            'responder_creature_type': (str, False),
+            'responder_qualification': (str, False),
+            'map_id': (int, False),
+            'instance_id': (int, False),
+            'map_name': (str, False),
+            'is_dungeon': (bool, False),
+            'is_raid': (bool, False),
         },
     ),
 
@@ -582,7 +657,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         handler_module='chatter_proximity',
         handler_func='handle_proximity_player_say',
         producer='LLMChatterProximity.cpp',
-        priority='normal',
+        priority='high',
         description=(
             'Response to player /say with no '
             'active scene'
@@ -592,6 +667,12 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
             'player_name': (str, True),
             'player_message': (str, True),
             'zone_name': (str, True),
+            'subzone_name': (str, False),
+            'map_id': (int, False),
+            'instance_id': (int, False),
+            'map_name': (str, False),
+            'is_dungeon': (bool, False),
+            'is_raid': (bool, False),
             'participants': (list, True),
         },
     ),
@@ -602,17 +683,103 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
             'handle_proximity_player_conversation'
         ),
         producer='LLMChatterProximity.cpp',
-        priority='normal',
+        priority='high',
         description=(
-            'Multi-speaker response to player /say'
+            'Directed NPC or ungrouped playerbot response chain '
+            'to player /say'
         ),
         payload_fields={
             'player_guid': (int, True),
             'player_name': (str, True),
             'player_message': (str, True),
             'zone_name': (str, True),
+            'subzone_name': (str, False),
+            'map_id': (int, False),
+            'instance_id': (int, False),
+            'map_name': (str, False),
+            'is_dungeon': (bool, False),
+            'is_raid': (bool, False),
             'participants': (list, True),
             'max_lines': (int, True),
+        },
+    ),
+
+    'proximity_player_emote': EventSpec(
+        handler_module='chatter_proximity',
+        handler_func='handle_proximity_player_emote',
+        producer='LLMChatterProximity.cpp',
+        priority='high',
+        description=(
+            'Directed NPC/playerbot response or nearby witness chain '
+            'to a player emote'
+        ),
+        payload_fields={
+            'player_guid': (int, True),
+            'player_name': (str, True),
+            'player_emote': (str, True),
+            'player_emote_id': (int, True),
+            'custom_emote': (int, False),
+            'mirror_emote': (str, False),
+            'addressed_name': (str, True),
+            'addressed_participant': (dict, False),
+            'addressed_speaks': (bool, False),
+            'interaction': (str, True),
+            'interaction_mode': (str, True),
+            'zone_name': (str, True),
+            'subzone_name': (str, False),
+            'map_id': (int, False),
+            'instance_id': (int, False),
+            'map_name': (str, False),
+            'is_dungeon': (bool, False),
+            'is_raid': (bool, False),
+            'participants': (list, True),
+            'max_lines': (int, True),
+        },
+    ),
+
+    'proximity_boss_approach': EventSpec(
+        handler_module='chatter_boss_dialogue',
+        handler_func='handle_boss_dialogue',
+        producer='LLMChatterBossDialogue.cpp',
+        priority='normal',
+        description='Safe pre-aggro dungeon or raid boss line',
+        payload_fields={
+            'player_guid': (int, True),
+            'player_name': (str, True),
+            'zone_name': (str, True),
+            'map_id': (int, True),
+            'instance_id': (int, True),
+            'map_name': (str, True),
+            'is_dungeon': (bool, True),
+            'is_raid': (bool, True),
+            'encounter_state': (str, True),
+            'trigger': (str, True),
+            'automatic_line_number': (int, True),
+            'presence_id': (int, True),
+            'boss': (dict, True),
+        },
+    ),
+
+    'proximity_boss_player_say': EventSpec(
+        handler_module='chatter_boss_dialogue',
+        handler_func='handle_boss_dialogue',
+        producer='LLMChatterBossDialogue.cpp',
+        priority='high',
+        description='Boss response to targeted or named player /say',
+        payload_fields={
+            'player_guid': (int, True),
+            'player_name': (str, True),
+            'player_message': (str, True),
+            'zone_name': (str, True),
+            'map_id': (int, True),
+            'instance_id': (int, True),
+            'map_name': (str, True),
+            'is_dungeon': (bool, True),
+            'is_raid': (bool, True),
+            'encounter_state': (str, True),
+            'trigger': (str, True),
+            'presence_id': (int, True),
+            'boss': (dict, True),
         },
     ),
 
@@ -627,6 +794,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         priority='high',
         description='BG match begins',
         payload_fields={
+            'ab_state': (dict, False),
             'event_detail': (str, True),
         },
     ),
@@ -639,6 +807,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         producer='LLMChatterBG.cpp',
         description='BG match ends',
         payload_fields={
+            'ab_state': (dict, False),
             'winner_team': (str, True),
             'won': (int, True),
             'final_score_alliance': (int, True),
@@ -653,6 +822,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         priority='critical',
         description='Flag picked up in WSG/EY',
         payload_fields={
+            'ab_state': (dict, False),
             'flag_team': (str, True),
             'carrier_guid': (int, False),
             'carrier_name': (str, False),
@@ -666,6 +836,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         priority='critical',
         description='Flag dropped in WSG/EY',
         payload_fields={
+            'ab_state': (dict, False),
             'flag_team': (str, True),
             'dropper_guid': (int, False),
             'dropper_name': (str, False),
@@ -679,6 +850,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         priority='critical',
         description='Flag captured in WSG',
         payload_fields={
+            'ab_state': (dict, False),
             'flag_team': (str, True),
             'new_score': (int, True),
             'scorer_name': (str, False),
@@ -694,6 +866,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         priority='critical',
         description='Flag returned in WSG',
         payload_fields={
+            'ab_state': (dict, False),
             'flag_team': (str, True),
             'returner_name': (str, True),
             'returner_is_real_player': (int, True),
@@ -707,9 +880,18 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         priority='critical',
         description='AB/EY node contested',
         payload_fields={
-            'node_name': (str, True),
-            'new_owner': (str, True),
+            'ab_state': (dict, False),
+            'node_changes': (list, False),
+            'node_id': (int, False),
+            'node_revision': (int, False),
+            'node_name': (str, False),
+            'new_owner': (str, False),
             'claimer_name': (str, False),
+            'prev_state': (int, False),
+            'state': (int, False),
+            'transition': (str, False),
+            'evidence': (str, False),
+            'observation_gap_ms': (int, False),
         },
     ),
 
@@ -720,9 +902,18 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         priority='critical',
         description='AB/EY node captured',
         payload_fields={
-            'node_name': (str, True),
-            'new_owner': (str, True),
+            'ab_state': (dict, False),
+            'node_changes': (list, False),
+            'node_id': (int, False),
+            'node_revision': (int, False),
+            'node_name': (str, False),
+            'new_owner': (str, False),
             'claimer_name': (str, False),
+            'prev_state': (int, False),
+            'state': (int, False),
+            'transition': (str, False),
+            'evidence': (str, False),
+            'observation_gap_ms': (int, False),
         },
     ),
 
@@ -735,6 +926,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         priority='high',
         description='PvP kill in BG',
         payload_fields={
+            'ab_state': (dict, False),
             'victim_name': (str, True),
             'victim_class': (int, True),
             'killer_name': (str, True),
@@ -750,6 +942,9 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         producer='LLMChatterBG.cpp',
         description='AB/EY score milestone reached',
         payload_fields={
+            'ab_state': (dict, False),
+            'milestone_kind': (str, False),
+            'ab_state': (dict, False),
             'milestone_team': (str, True),
             'milestone_value': (int, True),
             'milestone_description': (str, True),
@@ -765,6 +960,8 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
         priority='filler',
         description='Ambient BG chatter',
         payload_fields={
+            'ab_objective_status': (bool, False),
+            'ab_state': (dict, False),
             'player_name': (str, True),
         },
     ),
@@ -910,6 +1107,28 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
             'initial_delay_seconds': (int, False),
             'initial_delay_band': (str, False),
             'candidates': (list, True),
+        },
+    ),
+
+    # -- Real General loot (chatter_loot) ---------
+
+    'bot_loot_item': EventSpec(
+        handler_module='chatter_loot',
+        handler_func='process_general_loot_event',
+        producer='LLMChatterLoot.cpp',
+        description=(
+            'Bot announces an item it actually looted'
+        ),
+        payload_fields={
+            'item_id': (int, True),
+            'item_name': (str, True),
+            'item_quality': (int, True),
+            'item_count': (int, True),
+            'allowable_class': (int, True),
+            'required_level': (int, True),
+            'loot_source_guid': (str, False),
+            'zone_id': (int, False),
+            'area_id': (int, False),
         },
     ),
 
@@ -1063,7 +1282,7 @@ EVENT_REGISTRY: Dict[str, EventSpec] = {
 
 
 # --------------------------------------------------
-# Dead (removed) event types — 13 entries
+# Dead (removed) event types — 12 entries
 # --------------------------------------------------
 
 DEAD_EVENTS: frozenset = frozenset({
@@ -1077,7 +1296,6 @@ DEAD_EVENTS: frozenset = frozenset({
     'world_boss_spawn',
     'rare_spawn',
     'enemy_player_near',
-    'bot_loot_item',
     'bot_group_discovery',
     'bg_player_arrival',
 })

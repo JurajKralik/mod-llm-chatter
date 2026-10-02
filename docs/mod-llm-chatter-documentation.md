@@ -38,7 +38,14 @@ High-level behavior:
   and the player as they move through the world, with NPC speech bubbles
   and natural player reply detection
 - in-game addon bridge: `.llmc` command lets the Chatter Companion addon
-  read and write bot personality traits and tone from the game UI
+  edit bot personality traits from the game UI and view (or regenerate)
+  their tone and background story. Trait edits too long for one
+  255-character chat line are uploaded in chunks (`put` / `commit` /
+  `cancel`). Every edit is written as one database transaction together
+  with its regeneration jobs, and only reported after it has committed.
+  The server also accepts typed backstories (`setbackstory`, `bs` chunks)
+  for manual use, but the addon never sends them. See
+  [`chatter-addon-reference.md`](chatter-addon-reference.md)
 - MultiBot-Chatless bridge coexistence: hidden `MBOT` addon traffic is
   ignored by chatter logging and left for `mod-multibot-bridge` by
   default, so chatter does not block the addon's chatless
@@ -84,6 +91,18 @@ world tick.
 Party channel may play text emotes.
 General, Guild, raid, and battleground delivery do not play text
 emotes.
+
+**Actions as emotes.** A leading `*action*` in a generated line is split
+off by `split_action_prefix()` and stored in the row's `action` column (a
+line that is nothing but an action stays intact). With
+`LLMChatter.ActionAsEmote.Enable = 1` (default), delivery sends it as a
+`/e`-style emote (`CHAT_MSG_MONSTER_EMOTE`, so the bot's name shows) just
+before the speech, on every channel. The action goes out only once the send
+is known to be valid — for party, after the bot's group has been confirmed —
+so it never plays ahead of speech that fails. If the speech is retried after
+the action has been shown, the action is dropped from the row so it is not
+replayed. With the option off, the action is rendered inline as
+`*action* text`.
 
 ---
 
@@ -165,13 +184,16 @@ urgent work.
 
 So event priority matters at claim time.
 
-### Legacy ambient queue ordering
+### Ambient queue ordering
 
-`llm_chatter_queue` is the older ambient queue. It is processed FIFO:
+`llm_chatter_queue` is processed FIFO:
 
 - `ORDER BY created_at ASC`
 
 `LLMChatter.MaxPendingRequests` currently gates this queue only.
+Each row carries the message family selected by C++. Trade rows also
+carry a value-only live inventory snapshot; Python never rerolls the
+family or queries saved inventory state.
 
 ### Final message delivery ordering
 
@@ -337,7 +359,23 @@ Owns ambient world/event behavior:
 - holiday start/stop routing
 - weather state and transition handling
 - ambient zone selection and faction choice
+- message-family selection
+- trade-item snapshot requests after trade is selected
 - ambient chatter queue writes
+
+### `src/LLMChatterLoot.cpp` and `src/LLMChatterLoot.h`
+
+Own real ungrouped-playerbot loot announcements: `OnPlayerLootItem`
+capture, one RNG decision per loot source, uniform item reservoir
+sampling, bounded per-bot aggregation, audience/cooldown checks, and
+`bot_loot_item` queueing.
+
+### `src/LLMChatterTrade.cpp` and `src/LLMChatterTrade.h`
+
+Own demand-driven scans of the selected ambient seller's backpack and
+equipped bags. Only tradeable, non-conjured, non-quest, non-expiring
+items are eligible. A configurable quality-weighted reservoir chooses one
+slot, and the result is copied into a value-only snapshot.
 
 ### `src/LLMChatterNearby.cpp`
 
@@ -408,8 +446,8 @@ Owns emote reaction system:
 - `DelayedMirrorEmoteEvent`, `DelayedCreatureMirrorEmoteEvent`
 - emote static data: mirror map, denylist, combat callouts, contagious
   set
-- `HandleEmoteAtGroupBot()`, `HandleEmoteAtCreature()`,
-  `HandleEmoteObserver()`
+- `HandleEmoteAtGroupBot()`, `HandleEmoteAtUngroupedBot()`,
+  `HandleEmoteAtCreature()`, `HandleEmoteObserver()`
 - `EvictEmoteCooldowns()`
 
 ### `src/LLMChatterGroupQuest.cpp`
@@ -443,6 +481,7 @@ Owns battleground-specific hooks and BG queue helpers.
 - `tools/llm_chatter_bridge.py`
 - `tools/chatter_event_registry.py`
 - `tools/chatter_ambient.py`
+- `tools/chatter_loot.py`
 
 ### Group domain
 
@@ -481,6 +520,10 @@ handler map.
 - `tools/chatter_links.py`
 - `tools/chatter_events.py`
 - `tools/chatter_prompts.py`
+- `tools/chatter_persona.py` - bot persona (identity + real event
+  mood) for Party, Guild and General prompts
+- `tools/chatter_threads.py` - party conversation threads (continuity,
+  subject changes, lingering feelings)
 - `tools/chatter_constants.py`
 - `tools/chatter_cache.py`
 - `tools/talent_catalog.py`
@@ -542,6 +585,28 @@ Some narrow server-side compatibility switches may be read directly
 through `sConfigMgr` instead of being stored on `LLMChatterConfig`.
 `LLMChatter.MultiBotCompat.Enable` follows that shape.
 
+### Server-side player-chat prefix filtering
+
+`LLMChatter.PlayerChat.IgnoredPrefixes` is a comma-separated, default-empty
+denylist for server-specific protocols sent through visible player chat or
+for admin-command prefixes. It is not needed for normal `SendAddonMessage`
+protocol prefixes, which arrive as `LANG_ADDON` and are already ignored. C++
+parses the setting on startup and `.reload config`, publishes an immutable
+snapshot, and applies it to real-player Party, General, Guild, and `/say`
+input. Matching ignores leading whitespace and ASCII letter case.
+Configured entries are trimmed at both ends, so a trailing space cannot be
+used to require a separator; use an unambiguous punctuation-bearing prefix.
+
+The check runs before chat-history writes, cooldowns, Guild-session changes,
+login-greeting cancellation, or event queueing. Existing addon-payload and
+Playerbot-command filters remain in place. Because matching is literal prefix
+matching, configure punctuation or otherwise unambiguous server-specific
+values rather than ordinary words.
+
+| Key | Default | Owner | Purpose |
+|---|---|---|---|
+| `PlayerChat.IgnoredPrefixes` | empty | Server | Drop configured player-chat prefixes before persistence or generation |
+
 ---
 
 ## 5. Supported Providers
@@ -559,6 +624,31 @@ Supported providers:
 - OpenRouter
 - Ollama
 
+Changing models normally requires only the provider and model ID. The
+bridge resolves a conservative capability profile for OpenAI-compatible
+targets, including direct OpenAI, Google, OpenRouter, and Ollama. Known
+sampling models receive `temperature`; known reasoning models receive
+their supported token-limit shape and configured reasoning effort;
+unrecognized direct OpenAI models start without optional parameters.
+
+If a provider explicitly rejects `temperature`, `reasoning_effort`,
+`max_tokens`, or `max_completion_tokens`, the bridge adjusts that one
+parameter, retries the rejected request, and caches the successful shape
+for that provider/model until restart. This recovery is limited to HTTP 400
+or 422 errors and prefers the provider's structured parameter/code fields;
+other failures are not hidden or retried by this compatibility path.
+
+Generic provider error types such as `invalid_request_error` are not treated
+as parameter rejection codes by themselves. When a dotted GPT-5 generation
+rejects `ReasoningEffort = none`, the retry also removes temperature and
+expands the completion budget before allowing the model's default reasoning.
+
+OpenAI reasoning tokens share the completion-token budget. The bridge applies
+`OpenAI.MaxTokensMultiplier` when reasoning is enabled, left at the model
+default, or cannot be disabled by the selected model. The multiplier is
+clamped to 1-8 and is skipped for models such as Luna when they accept
+`ReasoningEffort = none`.
+
 Examples:
 
 ```ini
@@ -568,7 +658,9 @@ LLMChatter.Model = haiku
 
 ```ini
 LLMChatter.Provider = openai
-LLMChatter.Model = gpt4o-mini
+LLMChatter.Model = gpt-5.6-luna
+LLMChatter.OpenAI.ReasoningEffort = none
+LLMChatter.OpenAI.MaxTokensMultiplier = 4
 ```
 
 ```ini
@@ -588,10 +680,35 @@ LLMChatter.Model = openai/gpt-4o-mini
 LLMChatter.OpenRouter.ApiKey = sk-or-v1-xxxxx
 ```
 
+Reasoning is opt-in for OpenRouter. An empty effort preserves the
+provider/model defaults; `none` explicitly disables reasoning on hybrid
+models. Higher efforts share the response token budget with visible
+output, so increase the multiplier when responses become empty or
+truncated:
+
+```ini
+LLMChatter.Provider = openrouter
+LLMChatter.Model = deepseek/deepseek-v4-flash
+LLMChatter.OpenRouter.ReasoningEffort = high
+LLMChatter.OpenRouter.ReasoningExclude = 1
+LLMChatter.OpenRouter.MaxTokensMultiplier = 5
+```
+
+`ReasoningExclude` hides reasoning text returned by OpenRouter but does
+not reduce reasoning-token usage or cost. The multiplier is ignored
+when the effort is empty or `none`. OpenRouter effort values are passed
+through without client-side validation because support varies by model.
+
 ```ini
 LLMChatter.Provider = ollama
 LLMChatter.Model = qwen3:4b
 ```
+
+Ollama context size must be configured on the Ollama server with
+`OLLAMA_CONTEXT_LENGTH` or `PARAMETER num_ctx` in a Modelfile; the
+OpenAI-compatible endpoint does not accept it per request. Verify the loaded
+context with `ollama ps`. `Ollama.DisableThinking = 1` sends
+`reasoning_effort = none` and retains `/no_think` as a model fallback.
 
 ### System prompt support
 
@@ -606,14 +723,29 @@ system message and a user message.
 Provider behavior:
 
 - **Anthropic**: system content passed via the `system=` parameter
-  on the API call (native system prompt support)
+  on the API call (native system prompt support); sampling temperature
+  is sent through `extra_body` for Anthropic SDK v1 compatibility
 - **OpenAI**: system content sent as a `{"role": "system", ...}`
-  message prepended to the messages array
+  message prepended to the messages array. Modern reasoning models use
+  `max_completion_tokens`; custom temperature is used only with a
+  compatible reasoning effort, and `OpenAI.ReasoningEffort` can select
+  an effort such as `none` for short-form chat. Stale reasoning settings
+  are ignored when switching back to a sampling model. Reasoning-capable
+  requests receive a configurable output-budget multiplier when hidden
+  reasoning can be active
 - **Google Gemini**: uses Google's OpenAI-compatible chat-completions
   endpoint, so system content is sent as a system role message
 - **OpenRouter**: uses OpenRouter's OpenAI-compatible
-  chat-completions endpoint with optional attribution headers
-- **Ollama**: same as OpenAI (system role message)
+  chat-completions endpoint with optional attribution headers and an
+  opt-in `reasoning` object for normal and quick-analysis requests
+- **Ollama**: same system-role message shape; context is configured on the
+  Ollama server, and thinking can be disabled through the compatibility
+  parameter plus a `/no_think` fallback
+
+The shared `llm_compat.py` layer owns cross-model parameter capability
+selection and the narrow unsupported-parameter recovery path. Provider
+extensions remain in `chatter_llm.py`, keeping model quirks out of the
+feature and prompt modules.
 
 When a plain string is passed to `call_llm()` instead of
 `PromptParts`, the entire prompt is sent as a single user message
@@ -627,7 +759,11 @@ When a plain string is passed to `call_llm()` instead of
 | `_build_chat_messages()` | Assembles the provider-specific messages array |
 | `_ollama_user_msg()` | Formats the user message for Ollama's chat API |
 | `_apply_google_options()` | Applies Gemini reasoning/thinking settings for OpenAI compatibility |
+| `_apply_openrouter_options()` | Applies opt-in OpenRouter reasoning settings |
 | `_openrouter_headers()` | Builds optional OpenRouter attribution headers |
+| `build_compatible_chat_request()` | Builds the shared production request used by normal calls, quick analysis, and the health probe |
+| `llm_compat.build_chat_options()` | Selects safe token, sampling, and reasoning parameters for a provider/model target |
+| `llm_compat.create_chat_completion()` | Retries explicit parameter rejections and caches the learned correction |
 
 ---
 
@@ -639,11 +775,186 @@ Configured through:
 
 Modes:
 
-- `normal`: casual MMO-style chat
+- `normal`: playerbots speak as people playing WoW
 - `roleplay`: in-character, race/class-influenced chat
 
-The Python prompt builders are mode-aware and choose different tone,
-mood, and style guidance based on the configured mode.
+The Python prompt builders use `chatter_mode.py` as the canonical voice
+contract. Normal mode applies to playerbot speech in General, Party,
+Guild, Battleground, Raid, screenshot reactions, emote reactions, and
+playerbot proximity `/say`. It has a friendly and respectful baseline,
+allows polite, quiet, dry, playful, blunt, or occasionally mildly salty
+players, and avoids making toxicity or forced gamer slang the default.
+
+Normal prompts treat race, class, level, health, travel, weather, and
+locations as character or game state rather than sensations physically
+experienced by the speaker. Character backstories and race/class
+worldview material are prompt inputs only in roleplay mode. Memory
+callbacks in normal mode are framed as remembered gameplay events.
+
+Actual NPCs are the exception: they always remain lore-friendly,
+in-world speakers. Proximity chatter can contain NPCs and playerbots in
+the same scene, so `chatter_proximity.py` applies the voice rule per
+speaker using the existing `is_npc` payload field.
+
+Changing `LLMChatter.ChatterMode` requires a bridge restart. Because
+`llm_group_cached_responses` has no mode column, bridge startup removes
+only `ready` pre-cache rows and then refills them under the active mode;
+used and expired history is left to normal cache hygiene.
+
+### General player-reply length variety
+
+Substantive General replies use weighted short, medium and developed bands
+in both normal and roleplay modes. Configure
+`LLMChatter.GeneralChat.PlayerReplyLengthWeights` (default `35,45,20`)
+and `PlayerReplyLengthMaxima` (default `75,150,240`). These produce
+approximate bands of 1-75, 76-150 and 151-240 characters. Player intent and
+conversational scale take priority: a simple answer should stay simple,
+and a bot should never add filler to meet a target.
+
+A followup avoids the primary's band; each continuation avoids the last
+successfully queued line's band when another band has positive weight.
+A configuration enabling only one band is honored. Chosen hints are kept
+through repair and recorded as `general_reply_length_tier` in request
+metadata. Existing sentence-aware delivery cleanup still caps messages
+at 255 characters. Truly brief casual turns keep their separate tier and
+repair rules and do not expand into extended conversations.
+
+This policy does not change Party, Guild or autonomous General lengths.
+Both configuration settings require a chatter bridge restart. Prompt
+coverage verifies which guidance is sent, but actual length distribution
+and conversational feel should be assessed with the configured live model.
+
+### Persona coherence
+
+A bot always speaks as the same person in Party, Guild and General chat.
+Nothing random overrides its identity.
+
+- **Identity**: grouped bots use the traits, tone and (roleplay)
+  backstory assigned when they joined, in Party, Guild and General
+  alike. Other bots use their stored identity if they have one.
+  Otherwise they get a stable fallback derived from the bot, the same
+  on every message and in every channel, instead of new random traits
+  per reply. Normal mode keeps its player-style personality and never
+  receives backstories.
+- **Mood**: comes only from real events (kills, loot, deaths, wipes,
+  level-ups...) and is shared across channels, so a bot that just wiped
+  sounds gloomy in guild chat too. Each new event nudges the mood back
+  toward neutral before applying its own effect, and a mood with no
+  events for two hours is ignored. A neutral bot gets no mood line at
+  all. Conversations have no random
+  per-message moods; emotions shift only in reaction to what is said,
+  through each speaker's personality.
+- **Flavor**: optional creative angles and background feelings
+  ("spices") still add variety, but they are rarer and worded as
+  subordinate to the speaker's personality.
+- **Backstory reach**: in roleplay mode, party idle chatter and idle
+  conversations include the backstory at
+  `LLMChatter.Backstory.IdleChance` percent (default 100). Party event
+  reactions, replies to the player and multi-bot party conversations
+  include each speaker's backstory at
+  `LLMChatter.Backstory.PartyReactionChance` percent (default 50);
+  quick casual replies never do.
+
+General and Guild now prepare missing roleplay profiles before a selected
+bot speaks. Traits are chosen from the existing personality pools; tone
+and backstory use the same generators as Party. Existing nonempty fields
+are reused, including manual edits. The first use can take longer because
+it may require tone and backstory generation before the speech request.
+Generation failures leave a stable fallback voice and retry missing fields
+after `LLMChatter.Profile.RetrySeconds` (default 300).
+
+Persistent roleplay profiles are independent of journal memory. With
+`Memory.Enable=0`, Party retains its existing random session traits;
+General and Guild honor that active session identity while the bot is
+in the group. Outside a group they reuse the persistent profile.
+`Memory.IdentityVersion` still intentionally regenerates the persistent
+identity. Normal mode retains its player-style personality and does not
+create roleplay backstories.
+
+General and Guild independently include each speaker's backstory at
+`Backstory.GeneralChance` and `Backstory.GuildChance` (both default 25).
+A conversation can therefore include none, some or all backgrounds.
+Traits and tone are always supplied. Sampling affects prompt context
+only, never storage; it stays fixed across repairs and continuation turns.
+These gates include player replies, while conversational brevity rules
+still apply. Party's existing gates and brief-reply exclusion are unchanged.
+
+For Guild invitations, the bridge discovers accepted membership on its
+next profile scan: `Profile.GuildScanIntervalSeconds` defaults to 15,
+and `Profile.GuildBatchSize` defaults to 2 profiles per scan. Only guilds
+with a current online real-player Guild session qualify. Existing members
+are backfilled at the same bounded rate, and selected speakers are checked
+before speech regardless of scan progress. Bot-only guilds are excluded.
+If both Guild player replies and login greetings are disabled, no real-player
+Guild session exists for prewarming; selected-speaker preparation remains.
+No C++ build or schema migration is needed for this profile change; activate
+Python/config changes by restarting the chatter bridge when deploying.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `LLMChatter.Persona.TwistChance` | 25 | Percent of prompts that get an optional creative angle |
+| `LLMChatter.Persona.SpiceChance` | 30 | Percent of prompts that get background feelings at all |
+| `LLMChatter.PersonalitySpiceCount` | 2 | How many background feelings when the spice roll passes |
+
+All three are bridge-side settings and need a bridge restart.
+
+### Conversation threads (party, guild, General)
+
+Party idle chatter, guild chat and the General channel now behave
+like people talking rather than a fresh random topic each time. Each
+party has its own thread, each guild has one, and each zone's General
+channel has one per faction; whoever speaks next picks up or shifts
+that talk through their own personality. Guild and General can be
+switched off separately (`Threads.GuildEnable`,
+`Threads.GeneralEnable`).
+
+- A subject usually runs for a few exchanges, then drifts to something
+  related, gets called back later ("about what you said earlier"), or
+  gives way to a fresh one. Fresh subjects mostly come from what a bot
+  personally cares about, then from the surroundings, and only
+  occasionally from the random topic pool.
+- Feelings linger: if a bot was stung or delighted, that carries into
+  the next exchanges even after the subject changes, and shows through
+  its personality. Disagreements are real but friendly.
+- Your party messages blend in: bots answer you and weave the ongoing
+  subject in when it relates, then may drift back to it later.
+- Events interrupt: after a fight or loot, the talk can resume if the
+  subject still has life in it. A wipe or a death takes over the
+  conversation.
+- Nothing is scripted. Each exchange gets a soft nudge the model may
+  ignore, and every kind of move stays possible. Now and then a bot is
+  explicitly allowed a believable surprise: changing its mind, going
+  off on a tangent or taking an unexpected stance.
+- The model reports the thread state in the same call, so there are no
+  extra LLM calls. Only lines that were actually delivered in game
+  count: an exchange that was dropped or never spoken leaves no trace.
+- The state lives in bridge memory for the group session and is
+  cleared when the group ends or the bridge restarts.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `LLMChatter.Threads.Enable` | 1 | Turn conversation threads on or off |
+| `LLMChatter.Threads.GuildEnable` / `GeneralEnable` | 1 / 1 | Per-channel switches for guild chat and the General channel |
+| `LLMChatter.Threads.HistorySize` | 5 | Finished subjects remembered for callbacks |
+| `LLMChatter.Threads.ExchangeDecay` | 70 | Percent of energy a subject keeps per exchange (stickiness) |
+| `LLMChatter.Threads.CoolMinutes` | 15 | Minutes of silence that halve a subject's energy |
+| `LLMChatter.Threads.FeelingTurns` | 3 | Exchanges a lingering feeling stays visible |
+| `LLMChatter.Threads.PersonaTopicWeight` | 60 | Fresh subjects from a bot's own interests |
+| `LLMChatter.Threads.SurroundingsTopicWeight` | 30 | Fresh subjects from the surroundings |
+| `LLMChatter.Threads.PoolTopicWeight` | 10 | Fresh subjects from the random topic pool |
+| `LLMChatter.Threads.SurpriseChance` | 12 | Percent of exchanges that explicitly allow a surprise |
+| `LLMChatter.Threads.HighEnergyThreshold` / `LowEnergyThreshold` | 60 / 30 | Energy bands for the move weights |
+| `LLMChatter.Threads.HighEnergyMoveWeights` | 70,20,5,5 | continue,drift,callback,new weights for a lively subject |
+| `LLMChatter.Threads.MidEnergyMoveWeights` | 35,35,15,15 | Weights for a subject with some life left |
+| `LLMChatter.Threads.LowEnergyMoveWeights` | 10,25,25,40 | Weights for a subject running out |
+| `LLMChatter.Threads.PendingTimeoutSeconds` | 300 | Unsent lines after this count as dropped |
+| `LLMChatter.Threads.MaxPending` | 6 | Unconfirmed idle exchanges held per party |
+| `LLMChatter.Threads.IdleTTLMinutes` | 180 | Forget a party's threads after this much inactivity |
+| `LLMChatter.Threads.MaxGroups` | 200 | Parties kept in thread memory |
+| `LLMChatter.Threads.MaxInterruptions` | 4 | Recent player lines/events shown to the next exchange |
+| `LLMChatter.Threads.ReportTokens` | 90 | Output tokens reserved for the thread report |
+
+All are bridge-side settings and need a bridge restart.
 
 ---
 
@@ -677,17 +988,25 @@ Ambient requests can become:
 
 - plain statements
 - quest statements
-- loot statements
 - quest + reward statements
-- trade-style statements
+- trade-style statements grounded in an item currently owned by the
+  first speaker
 - NPC gossip statements/conversations
 - bot gossip statements/conversations
 - multi-bot conversations
 
-NPC and bot gossip are selected by additive Python-side RNG gates
-(`AmbientNpcGossipChance`, `AmbientBotGossipChance`) before the
-regular plain/quest/loot/trade/spell mix. If a target cannot be
-resolved, the request falls back to plain ambient chatter.
+C++ selects the family once, using the additive gossip gates
+(`AmbientNpcGossipChance`, `AmbientBotGossipChance`) before the regular
+plain/quest/quest-reward/trade/spell mix. Python consumes that decision
+without another RNG roll. Only when trade wins does C++ scan the first
+speaker's live inventory and attach an item snapshot. If there is no
+eligible item, C++ changes the family to plain before inserting the row;
+malformed or missing snapshots also fall back to plain in Python. Eligible
+bag slots are selected with a weighted reservoir: common items keep weight
+one and each quality tier above common adds
+`AmbientTrade.QualityWeightBonus`. This favors unusual real items without
+excluding ordinary consumables, materials, or ammunition. Set the bonus to
+zero to restore uniform selection.
 
 NPC gossip targets are service/social NPCs spawned in the current zone,
 with the prompt receiving the NPC name, title/subname, function, creature
@@ -704,6 +1023,47 @@ Prompt generation and runtime logic live mainly in:
 - `tools/chatter_ambient.py`
 - `tools/chatter_prompts.py`
 - `tools/chatter_shared.py`
+
+| Key | Default | Purpose |
+|---|---:|---|
+| `LLMChatter.AmbientTrade.QualityWeightBonus` | 4 | Added trade-selection weight per quality tier above common |
+
+### Real loot announcements
+
+Real loot is not an ambient message family. `LLMChatterLoot.cpp` listens
+to successful `OnPlayerLootItem` callbacks from eligible ungrouped bots
+only while a same-faction real player is present in the same outdoor map
+and zone. It rejects empty source GUIDs and items below
+`GeneralLoot.MinQuality`, rolls `EventReactionChance` once per source,
+then chooses one item uniformly if that source produces several item
+callbacks.
+
+The hot hook reads a world-thread-published audience snapshot, performs
+only a cache-only cooldown check, and never walks all sessions, touches
+General channel membership, queries the database, or reads the random-bot
+manager's shared containers. Per-bot state is bounded to one active source
+and one completed source awaiting the next world tick. It also checks
+`Item::IsInWorld()` before reading the item entry or template because a
+stacked callback item may already have been freed. The world-thread flush
+restricts delivery to random bots and revalidates location, audience,
+channel eligibility, and the persisted zone cooldown before queueing the
+event. Python resolves exactly the recorded online random-bot GUID. It
+trusts the live zone captured and revalidated by C++ rather than the
+save-time `characters.zone` value.
+Ambient loot is no longer invented from zone loot-table queries, and no
+inventory or loot-event history is retained outside these bounded
+short-lived values.
+
+| Key | Default | Purpose |
+|---|---:|---|
+| `LLMChatter.GeneralLoot.Enable` | 1 | Enable real bot-loot announcements |
+| `LLMChatter.GeneralLoot.AggregationDelayMilliseconds` | 2500 | Quiet period for grouping callbacks from one source |
+| `LLMChatter.GeneralLoot.ZoneCooldownSeconds` | 180 | Minimum interval between announcements in one zone |
+| `LLMChatter.GeneralLoot.MinQuality` | 2 | Minimum eligible item quality |
+
+Existing installations must apply
+`data/sql/characters/updates/20260919_real_general_items.sql` before
+starting a server built with this queue contract.
 
 ---
 
@@ -722,7 +1082,7 @@ Relevant responsibilities:
 
 - `OnPlayerCanUseChat(..., Channel*)`
 - bot membership enforcement for General
-- per-zone General cooldown handling
+- per-zone-and-faction General cooldown handling
 - writing/retaining `llm_general_chat_history`
 
 Shared note:
@@ -740,8 +1100,38 @@ Python handling lives in:
 That path:
 
 - selects responding bot(s)
+- rechecks that every responder matches the player's faction
+- reads same-faction General history and anti-repetition context for the
+  player response
 - builds the player-reaction prompt
 - dispatches the reaction through the bridge path
+
+The C++ producer also builds the candidate roster from same-team bots only.
+Delivery revalidates the event subject against the speaking bot as a final
+safeguard, preventing a Horde response from being marked successful in Horde
+General when the initiating player is Alliance, or vice versa.
+
+General keeps a bounded recent transcript per zone across both factions.
+`LLMChatter.GeneralChat.HistoryLimit` controls server-side and bridge-side
+pruning and the bridge's prompt read, ships as 15, and is clamped to 1-50.
+Prompt reads are filtered to the reader's faction, so a faction can receive
+fewer than the configured number of lines when both factions are active in a
+zone. When the key is absent, it falls back to
+`LLMChatter.ChatHistoryLimit`. Apply changes by reloading the server config and
+restarting the bridge together, because both processes prune the same table.
+Higher values preserve more short-term context but increase prompt size and
+token use.
+
+### Shared zone pacing
+
+Automated ambient and world-event General producers share one per-zone
+delivery reservation. Multi-line conversations reserve the complete
+scheduled sequence before inserting their first row, and the next
+automated sequence waits for `GeneralChat.MinZoneGap` after the prior
+one's final line. This serializes independently generated ambient,
+transport, weather, holiday, and minor-event chatter without reducing
+their trigger chances. Direct replies to a player's General message stay
+responsive and can interrupt that automated timeline.
 
 ### Relevant files
 
@@ -761,11 +1151,18 @@ active group in the same zone. The bridge queues
 `tools/chatter_group_general_reaction.py` generates either one party
 statement or a short 2-3 bot party conversation.
 
+The relay is eligible only when its General speaker, the group's real player,
+and all party responders share the same faction. This is checked both when the
+relay is queued and again when it is processed.
+
 The relay chance is controlled by
 `LLMChatter.GroupChatter.GeneralRelayChance` and defaults to 10%. When a
 relay fires, the first party line is scheduled for 3-6 seconds after the
 General line's planned visible time. The first party line must reference
-the General speaker by name.
+the General speaker by name. Relay prompts limit every party line to 150
+characters. If a provider still returns an overlong line, cleanup prefers a
+complete sentence and otherwise shortens at a word boundary instead of
+cutting through a word.
 
 ---
 
@@ -788,6 +1185,9 @@ Examples include:
 - zone transitions
 - dungeon entry reactions
 - nearby-object observations
+- overworld PvP against the opposing faction (engage, kill, death,
+  wipe, offensive spells, low health/mana, enemy target switches)
+- duel start and duel end
 
 Note: subzone discovery reactions (`OnPlayerGiveXP` with `XPSOURCE_EXPLORE`) have been
 removed. They caused duplicate messages alongside zone transition events. Discovery
@@ -799,6 +1199,8 @@ Current group-side ownership is in:
 
 - `LLMChatterGroup.cpp`
 - `LLMChatterGroupCombat.cpp`
+- `LLMChatterGroupPvP.cpp` (overworld PvP)
+- `LLMChatterDuel.cpp` (duels)
 
 Important responsibilities:
 
@@ -816,6 +1218,7 @@ Current Python group ownership is split across:
 - `chatter_group_handlers.py`
 - `chatter_group_prompts.py`
 - `chatter_group_state.py`
+- `chatter_duel.py` (duel reactions)
 
 ### Pre-cache path
 
@@ -825,6 +1228,57 @@ That path is separate from live event generation and lives mainly in:
 
 - `tools/chatter_cache.py`
 - `tools/chatter_group_prompts.py`
+
+### Overworld PvP encounters
+
+Group bots react to open-world fights against the opposing faction.
+The enemy may be a real player or a playerbot; prompts describe both as
+characters of the opposing faction and never as bots, NPCs, or
+monsters. Battlegrounds and arenas keep their own chatter.
+
+- Engaging an enemy, defeating one, a group member's death, a full
+  wipe, offensive spells or crowd control on an enemy, and low
+  health/mana during the fight reuse the existing group event types.
+  The C++ payload adds `enemy_kind: "player"` plus the enemy's name,
+  race, class, level, faction, level gap, whether the kill earns honour
+  (`is_gray_kill`), and who started the fight (`initiator`).
+- Identity is gated on what the reacting bot can perceive: the same map
+  and instance, within visibility range, and `CanSeeOrDetect()`.
+  Stealthed or out-of-sight enemies produce anonymous reactions
+  ("an unseen enemy") or no engage reaction at all. A visible pet can be
+  named while its hidden owner stays anonymous.
+- Pet kills count: an enemy hunter pet killing a group member is a PvP
+  death, and a group pet killing an enemy is a PvP kill.
+- With `PvP.Enable = 0`, reactions during PvP fights are suppressed;
+  they never fall back to creature framing or creature caches. `bot_state`
+  only names a bot's current target when the bot can perceive it
+  (`IsUnitPerceivableBy()` in `LLMChatterShared.cpp`).
+- PvP events skip the creature-oriented pre-cache. The tank aggro-loss
+  callout becomes an "enemy switched targets" callout, which
+  `LLMChatter.GroupChatter.PvP.TargetSwitchCallout` can turn off.
+- Throttling uses `PvP.Cooldown` per group and event kind and
+  `PvP.EnemyCooldown` per enemy, so repeated ganks and corpse camping do
+  not flood party chat. Deaths also share `DeathCooldown`, and wipes use
+  `WipeChance` and `WipeCooldown`.
+- A named overworld PvP kill can become a `pvp_kill` memory, gated by
+  `LLMChatter.Memory.PvPKillGenerationChance`.
+
+Python adds the enemy description through `build_pvp_enemy_context()`,
+which `build_bot_state_context()` appends for every combat prompt. The
+kill, combat, and aggro-loss builders also switch their situation line
+for PvP.
+
+### Duels
+
+`LLMChatterDuel.cpp` queues `bot_group_duel_start` and
+`bot_group_duel_end` when a duellist belongs to a group with a real
+player and bots. A bot duellist or a group bot that can see the duel
+reacts. The end event carries the winner, the loser, and the outcome
+(`won`, `fled`, or `interrupted`); declined challenges and duels
+cancelled during the countdown are ignored. A spectator only learns the
+identity of duellists it can see, apart from its own party members. Prompts and handlers live in `tools/chatter_duel.py`.
+Settings: `LLMChatter.GroupChatter.Duel.Enable`, `Duel.StartChance`,
+`Duel.EndChance`, and `Duel.Cooldown`.
 
 ---
 
@@ -957,21 +1411,292 @@ rows instead of speaking directly.
 
 Battleground-specific logic is self-contained in its own files.
 
+Matches entered through Random Battleground use the selected map's rules
+and prompt context, just like directly queued matches. Event payloads carry
+the actual map type in `bg_type_id` and the original queue in
+`queue_type_id`. This applies to WSG flag/carry events, AB/EY objective and
+score polling, and arrival greetings; it does not change channel routing.
+
+Arathi Basin node reactions distinguish sampled claims, assaults,
+counter-claims, defences and captures using the observed pair and the
+core's captured flag. Wording is team-relative and never credits a nearby
+player. Ambiguous or older payloads describe only occupied, contested or
+neutral state. Both normal and RP modes use the same factual rules. A
+contested team is the claimant, not the occupied owner.
+
+First observations seed silently. The pending window retains its first
+previous state and latest result; multiple observed changes or long actual
+gaps degrade to state-only wording. Speech chance and cooldown can still
+suppress node lines; pending changes are consumed at the next speech
+opportunity without retry. Delivery-time state validation is not provided
+by this observation path.
+
+Existing BG selection settings (prefix `LLMChatter.`):
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `BGChatter.NodeEventChance` | 80 | Once per AB batch attempt; legacy per-node EY chance; 0 disables node reactions |
+| `BGChatter.ScoreMilestoneChance` | 80 | Per pending AB score attempt; 0 disables milestone reactions; EY keeps its legacy detection policy |
+| `BGChatter.StatePollingIntervalMs` | 3000 | Legacy polling and AB speech evaluation; 0 evaluates every update |
+| `BGChatter.BigEventCooldownSec` | 15 | Legacy shared big-event cooldown; AB node/score selection uses separate budgets; 0 disables this cooldown |
+| `BGChatter.AB.TransitionMaxGapMs` | 2000 | Maximum actual sample gap for transition labels; 0 uses state-only wording |
+| `BGChatter.AB.Enable` | 1 | AB node/resource observation, reactions and snapshots; other battlegrounds are unchanged |
+| `BGChatter.AB.NodeBatchCooldownSec` | 15 | Minimum between AB batch attempts, including chance failure; clamped 1-300 seconds |
+| `BGChatter.AB.PendingMaxAgeSec` | 30 | Expire pending changes since their latest change; clamped 1-300 seconds |
+| `BGChatter.AB.MaxNodesPerBatch` | 3 | Maximum referenced nodes per reaction; clamped 1-5 |
+| `BGChatter.AB.ScoreMilestonePercents` | 30,60,90 | Integers 1-99, sorted/deduplicated; any malformed list falls back to defaults |
+| `BGChatter.AB.ScoreCooldownSec` | 30 | Minimum between pending score attempts, including chance failure; clamped 1-300 seconds |
+| `BGChatter.AB.ObjectiveStatusIntervalSec` | 60 | Minimum between status opportunities; 0 disables, maximum 3600 seconds |
+| `BGChatter.AB.ObjectiveStatusChance` | 50 | Chance to replace an eligible idle opportunity with objective status; clamped 0-100 |
+| `BGChatter.AB.TimerEstimateMaxUncertaintySec` | 3 | Internal estimate width, clamped to 0-60 seconds; 0 omits estimates; no numerical timer speech |
+
+AB observes all five nodes every in-progress update regardless of the
+speech polling interval. Disabling chatter or leaving in-progress state
+clears AB reaction/estimate baselines; re-enable seeds a new baseline.
+Pre-start/end updates can still publish node snapshots without reactions. The
+observation gap is measured from actual monotonic timestamps. The default
+2000ms tolerates scheduling jitter around the core's one-second BG update.
+Labels describe net sampled team transitions, not every intermediate
+click. The inference relies on map-before-BG ordering and one 1000ms timer
+advance per BG update; it does not rely on banner spell cast duration.
+
+Recent AB node changes combine into one brief reaction, with oldest pending
+changes selected first and rotating ties. Failed chance rolls retain them
+until the next attempt or expiry. A newer change replaces its old revision;
+an entirely unsent reversal can cancel the obsolete alarm. Node batches
+have their own attempt cooldown, so score/start announcements cannot erase
+them. WSG/EY behavior is unchanged.
+
+AB node transitions use the BG-wide raid worker, without a Party copy.
+This includes claim, assault, counter-claim, defence, capture and state-only
+updates. Each eligible team/group receives at most one event per selected
+revision, regardless of how many humans or subgroups share that raid.
+Eligibility requires a present real listener and a bot in the same BG raid.
+Audience membership is frozen for a revision at its first insertion attempt:
+new humans in an existing group may hear retries, while entirely new groups
+receive
+future changes. Failed DB insertions retry only unacknowledged audiences;
+successful inserts are never replayed merely because generation or delivery
+later suppressed them. Pending scheduling waits for outstanding DB results
+and is bounded to five node records and one audience snapshot per revision.
+This acknowledges event insertion, not visible speech.
+
+### AB score milestones and objective status
+
+AB milestones use the actual verified match target. Default percentages
+produce 480/960/1440 for target 1600, 450/900/1350 for 1500, or
+300/600/900 for 1000. The core's 1400 warning is also included only when
+below the target. Thresholds round up, duplicate values collapse, and a
+warning wins a collision. Tiny targets cannot create a milestone at or
+above the winning score.
+
+Reached thresholds are remembered even when chance fails. Multiple
+crossings coalesce into the latest relevant pending context rather than
+replaying every milestone. Pending age and attempt spacing are independent:
+retry is possible only while the original crossing remains within
+`PendingMaxAgeSec`. Defaults of 30 seconds for both age and score cooldown
+may leave no second attempt after polling delay; tune these together if
+retries are desired. Ended matches discard pending score work. Configuration
+reload and late enable seed current scores without historical reactions.
+
+Objective status replaces an existing idle opportunity and uses the same
+Party filler gate and speaker selection. It is suppressed during pending
+or recent node batches. A failed status chance leaves ordinary idle chatter
+available. Zero interval or zero chance disables objective status without
+disabling ordinary idle chatter.
+
+Resource prompts describe observed lead/trail, owned and contested bases,
+income rates and resources remaining. A trailing team may earn faster, and
+a leading team may own no bases. Neither a score gap nor a raw score of
+1500 is treated as proof of dominance or an impending win. No exact
+finish-time prediction is produced. Malformed snapshots omit their facts
+and use conservative general encouragement instead.
+
+### AB snapshot context
+
+AB prompts receive a five-base snapshot: occupied owners, contested
+claimants, occupied counts and resource income from the core's nonlinear
+tick table. Contested bases earn nothing. All bases have equal resource
+value. The verified match target comes from that match's world-state data,
+so custom targets and config reloads do not substitute a guessed default.
+Unavailable target data is marked unverified and omitted from prompt facts;
+initialization retries on later updates.
+
+Base snapshots are reserved for node events, score milestones and idle/objective-status
+chatter. Node prompts expose only the referenced base; idle/status prompts
+receive all five. Arrival greetings, combat/death/spell/state callouts and
+player replies, including conversations and second speakers, receive no
+base snapshot. Normal and RP modes follow the same policy.
+Disabling `AB.Enable` clears the cached context and pending node
+reactions; the next enabled observation seeds silently. Existing chance
+and shared-cooldown policies remain unchanged.
+
+Optional internal contest estimates use the core BG clock and allow for
+unseen timer resets. They are omitted for unknown/gapped/ambiguous samples
+or excessive uncertainty. They are not displayed as countdowns. Snapshots
+are sampled context. Final delivery checks their age and the live five-node
+vector; numerical timer speech remains disabled because unseen same-state
+timer resets cannot be ruled out.
+
+### BG delivery freshness and rollout
+
+Queued BG-context lines are tied to a match lifetime and real recipient.
+Before any facing, action, emote or speech, delivery rechecks the match,
+actual map instance, team and group. Party also checks the recorded
+subgroup. Departures, instance reuse, stale facts and changed AB objectives
+drop the row with a diagnostic `bg_*` reason. New valid WSG/EY rows use the
+same guard and retain their existing generation and channel policies.
+
+Freshness limits are seconds from the original observation, including
+generation and queue delay:
+
+| Configuration under `LLMChatter.BGChatter.` | Default |
+|---|---:|
+| `FactualMaxAgeSec` (rows without AB base facts, all BGs) | 30 |
+| `AB.FactualMaxAgeSec` (rows carrying the AB snapshot) | 45 |
+| `MatchEndMaxAgeSec` (all BGs) | 45 |
+
+The AB limit applies only to node, idle/objective-status and score rows
+that carry `ab_state`; their base revisions are also rechecked at send.
+Normal pipeline latency (reaction delay, party gate, generation and
+pacing) can exceed 15 seconds, so a tighter AB limit silently drops
+otherwise current base-status lines.
+
+Values are clamped to 1-300; zero cannot disable validation. Match-end
+requires the same match in WAIT_LEAVE. Ordinary reactions require
+in-progress; arrival/start permit pre-start. Score snapshots do not claim
+an exact current score or predicted victory time. Node reactions validate
+only their referenced base and expose no other base/income facts.
+Idle/objective-status and score prompts expose the full snapshot and validate all
+five nodes. Ordinary replies have no base facts and check only the shared
+match, audience, status and age contract; unrelated captures cannot drop
+them. This deliberately means an ordinary reply has no authoritative
+five-base snapshot, including when the player asks about base control.
+
+AB objective wording is team-relative ("your team", "the enemy (Horde)").
+Snapshot prompts open with one race-verdict line (who leads by how much,
+who earns faster with how many bases held) so the key comparison is not
+buried in the detail lines. Milestones state absolute progress ("480 of
+1600 resources"), not percentages. Node facts spell out what a transition
+does not mean: a claim or assault is not held by anyone yet, an enemy
+claim on a neutral base is not a loss, and an assault on your base costs
+income but is lost only if it completes. Batched node prompts list the
+facts and state the shared constraint once.
+
+When the server can verify who took a banner, bots name them. A real
+player on your team gets warm, named recognition ("Karaez took that banner
+personally"); when their claim or assault later completes, bots can credit
+"Karaez's flag on Farm held". Bot teammates are mentioned lightly; enemy
+cappers are named neutrally. Credit requires the caster's own spell to have
+changed that base; when two clicks hit the same base between observations,
+or the evidence is otherwise unclear, nobody is named. Node prompts no
+longer include the team roster, so names never come from guesses.
+
+Age applies separately to every line, including later conversation turns.
+There is no exemption after the first line: a slow generation or delivery
+gate can truncate an exchange, possibly leaving a question unanswered.
+For example, lines sent at ages 10, 14 and 18 seconds under the 15-second
+limit allow the first two and reject the third. Match/audience checks also
+run for each line. The defaults are conservative freshness budgets from
+the implementation plan, not measured latency percentiles. No end-to-end
+generation latency has been measured for this rollout. Inspect
+`bg_facts_expired` drop reasons during an authorized live test and tune
+these limits for the configured model and pacing.
+
+BG classification uses owner, channel, event category or explicit BG
+payload fields, never map location alone. Group producer policy is:
+
+| Group events | Delivery policy |
+|---|---|
+| kill, combat, death, achievement, spell_cast, player_msg, low_health, oom | BG-enriched producers use the guard; ordinary variants retain group policy |
+| join_batch | Dedicated BG arrival uses the guard; ordinary group arrival retains group policy |
+| join, farewell, resurrect, corpse_run, zone_transition, subzone_change | Ordinary group policy without BG context |
+| loot, levelup, quest_accept, quest_accept_batch, quest_complete, quest_objectives, dungeon_entry, wipe | Ordinary group policy without BG context |
+| emote_reaction, emote_observer, nearby_object, aggro | Existing producer eligibility and ordinary group policy |
+
+The producer inventory is pinned in the transport regression tests. Any
+of these rows carrying explicit BG context is guarded regardless of its
+ordinary policy; no existing producer is silently suppressed by map ID.
+
+Deploy producer and bridge changes together. Before activation, finish or
+drain pending old-contract AB, WSG and EY work where practical, pausing
+production while draining. If old rows remain at activation, they are
+explicitly discarded by the final guard with `bg_contract_missing` rather
+than delivered without match identity. Restart also invalidates previous
+match tokens. Older incidental AB rows that still contain `ab_state` are
+discarded with `bg_ab_context_unexpected`, since previously generated prose
+may contain base claims even after the new bridge stops rendering them.
+Do not replay those rows into a new match. This applies to
+arrival and BG-context Party replies as well as BG-wide reactions.
+New C++ owners require source discovery in a separately authorized full
+build; Python changes require the affected bridge update. These deployment
+steps are separate from source implementation.
+
+### AB integrated verification and release gates
+
+Run the focused Python regressions directly from the module root:
+
+```text
+python tools/tests/test_arathi_integration.py
+python tools/tests/test_arathi_batches.py
+python tools/tests/test_arathi_resource_race.py
+python tools/tests/test_arathi_context.py
+python tools/tests/test_arathi_snapshot.py
+python tools/tests/test_bg_delivery_contract.py
+python tools/tests/test_battleground_type_context.py
+python tools/tests/test_battleground_flag_context.py
+python tools/tests/test_battleground_carrier_messages.py
+python tools/tests/test_normal_mode_player_chat.py
+```
+
+The integration test uses actual handlers, dispatch and response parsing,
+with LLM/DB boundary replacements. It covers node, score and objective
+idle events in both modes, Party filler deferral, invalid transport,
+missing speakers, generation/insertion failure and overlapping match
+generations. The source checks in other scripts do not execute C++ guards.
+
+Before release, complete these separately authorized gates:
+
+1. Compile and run the production-header harnesses under `tools/tests/cpp/`
+   (`test_ab_pending.cpp`, `test_ab_score.cpp`, `test_ab_integration.cpp`
+   and `test_json_fields.cpp`) with assertions enabled. A passing harness
+   does not replace the full module/worldserver build and link.
+2. Build with discovery of the new C++ owners and coordinate the bridge
+   update with the legacy-row policy above. Follow the host project's
+   build and restart instructions; no SQL migration is required for AB.
+3. Validate explicit and Random AB for both teams and normal/RP modes:
+   simultaneous nodes and score crossings, late entry, human/bot banner
+   interactions, subgroup changes, exit/requeue, match end, custom target
+   and disable/re-enable. Recheck WSG carrier/regrab/return and EY reactions.
+4. Delay generation across a node flip, subgroup move and match change.
+   Verify no facing, action, emote or speech occurs on rejected rows.
+   Test stalled observations, later conversation lines and actual listener
+   audibility. Examine `bg_facts_expired`, `bg_ab_node_changed`,
+   `bg_ab_state_changed`, `bg_subgroup_changed` and `bg_match_changed`.
+
+Python regression success establishes neither compiled compatibility nor
+live delivery correctness. Keep those outcomes distinct in release evidence.
+
 ### C++ ownership
 
 - `LLMChatterBG.cpp`
 - `LLMChatterBG.h`
+- `LLMChatterAB.cpp/.h`
+- `LLMChatterBGDelivery.cpp/.h`
 
 ### Python ownership
 
 - `chatter_battlegrounds.py`
 - `chatter_bg_prompts.py`
+- `chatter_ab.py`
+- `chatter_bg_delivery.py`
 - `chatter_raid_base.py`
 
 ### Typical BG events
 
 - match start / end
 - flag pickup / drop / capture / return
+- all AB node transitions, including state-only updates
 - node assault / capture
 - PvP kill
 - score milestones
@@ -992,7 +1717,7 @@ BG-wide only:
 Subgroup/party only:
 
 - PvP kills
-- node assault / capture chatter
+- EY node assault / capture chatter
 - score milestones
 - spell/state chatter
 - idle chatter
@@ -1008,7 +1733,7 @@ instructions so chatter stays short and tactical.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `BGChatter.MaxTokens` | 32 | Max token cap for BG prompt paths |
+| `BGChatter.MaxTokens` | 300 | Max token cap for BG prompt paths |
 
 ### Flag-carrier context persistence
 
@@ -1022,6 +1747,89 @@ from `AppendBGContext()` in `LLMChatterBG.cpp`.
 That means if a real player is carrying the enemy flag, later BG prompt
 requests continue to know that until the flag is dropped, returned, or
 captured.
+
+### Sub-group audibility
+
+Inside a battleground the player's group is the BG raid, and party chat
+only reaches the speaker's own sub-group. Party-channel BG chatter must
+therefore come from a bot in the real player's sub-group:
+
+- `GetRandomBotInGroup()` scopes BG raid reactors to the real player's
+  sub-group
+- `AppendRaidContext()` anchors `party_bot_guids` on the real player's
+  sub-group even when a bot triggered the event
+- the Python BG path skips a pinned speaker (self-state callout, flag
+  carrier) that is not in `party_bot_guids`
+
+### BG prompts for group events
+
+Group events that fire inside a battleground (combat, death, spell,
+low health, OOM, achievement) always use the `chatter_bg_prompts.py`
+builders, even when the reacting bot has traits, so every party line
+carries score, flag, and faction context. Self-state callouts are spoken
+by the bot they describe. For low-health callouts `target_name` is the
+wounded bot's combat target, not the wounded person.
+
+### BG arrival greetings
+
+About 15 seconds after a real player enters a battleground,
+`bot_group_join_batch` fires with the bots in the player's sub-group.
+Python independently selects one BG-wide greeting plus a second with
+`ArrivalRaidSecondChance` probability (default 50%), and a uniform Party
+count between `ArrivalPartyMin` and `ArrivalPartyMax` (default 0?3).
+Counts are capped by available subgroup bots; a bot can speak once in each
+channel. Channel choices survive failed generation of an earlier greeting.
+These are selection guarantees; duplicate suppression, generation failures
+and final delivery guards can still suppress messages. Disable the feature
+with `ArrivalGreetings.Enable = 0`. The old `ArrivalGreetingMin`,
+`ArrivalGreetingMax` and `ArrivalBGChannelGreetings` split controls are
+replaced by these independent controls.
+The event carries `match_in_progress` and live scores, so a late join is
+not described as the pre-fight gathering.
+BG arrivals skip the party welcome, composition comment, first-meeting
+memory, and farewell pre-generation.
+
+### Ongoing flag carries
+
+While a WSG flag is carried, C++ periodically queues `bg_idle_chatter`
+with a `flag_carry_status` marker and how long each flag has been held.
+Python answers with the flag-carry prompt: encourage the team's carrier
+(by name when it is a real player), hunt the enemy carrier, or react to
+a standoff. The cadence is `FlagCarryChatterIntervalSec` gated by
+`FlagCarryChatterChance`; `FlagCarryBGChannelChance` of those lines are
+said in battleground chat by the wider team instead of party chat.
+
+### Flag drops and re-grabs
+
+A WSG carrier losing the flag without a score change is reported as a
+drop even if the flag was already returned before the next state poll.
+A pickup by the same player who dropped that flag within
+`FlagRegrabWindowSec` is treated as a re-grab and gets no callout.
+
+These decisions use `tools/chatter_bg_flag_timeline.py`: flag events are
+fetched for the same recipient (`subject_guid`) and BG instance
+(`bg_instance_id`, added by `AppendBGContext()`), and judged by event-id
+order within one carry lifecycle, never by processing time. A drop whose
+flag was returned in the same carry (before or after the drop was queued)
+skips the team callout and keeps only the carrier's apology; a queued
+carry update is skipped if any flag event followed it.
+
+`AppendBGContext()` also sends `own_flag_state` / `enemy_flag_state`
+(`base`, `carried`, `ground`, `respawning`) in WSG, so prompts only claim
+a capture is possible while the team's own flag is at base.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `BGChatter.ArrivalGreetings.Enable` | 1 | Enable arrival greetings |
+| `BGChatter.ArrivalRaidSecondChance` | 50 | Percent chance of a second BG-wide greeting; first is always selected |
+| `BGChatter.ArrivalPartyMin` | 0 | Minimum independent Party greetings |
+| `BGChatter.ArrivalPartyMax` | 3 | Maximum independent Party greetings |
+| `BGChatter.FlagRegrabWindowSec` | 15 | Same-carrier re-pickup window with no callout; 0 disables |
+| `BGChatter.AchievementCooldownSec` | 45 | Min seconds between BG achievement reactions per group; 0 disables |
+| `BGChatter.AchievementRepeatWindowSec` | 300 | Min seconds before the same achievement gets another reaction in a BG; 0 disables |
+| `BGChatter.FlagCarryChatterIntervalSec` | 45 | Seconds between ongoing flag-carry lines; 0 disables |
+| `BGChatter.FlagCarryChatterChance` | 50 | Chance each carry interval produces a line |
+| `BGChatter.FlagCarryBGChannelChance` | 70 | Chance a carry line goes to BG chat instead of party |
 
 ---
 
@@ -1134,8 +1942,13 @@ more socially dynamic.
 Known playerbot control commands are not supposed to reach this
 conversation path in current source:
 
-- C++ now blocks them before creating `bot_group_player_msg` events
+- C++ blocks them before creating `bot_group_player_msg` events,
+  including known commands following a valid Playerbot `@target`
+  selector and `@command` shorthand
 - Python keeps `_is_playerbot_command()` as a fallback skip layer
+- ordinary `@BotName` conversation and non-command text after a simple
+  selector are preserved; valid aura and aggro selectors are always
+  treated as unconditional Playerbot control traffic
 
 ### Trigger logic
 
@@ -1178,6 +1991,11 @@ a third bot participates beyond the guaranteed two.
 |---|---|---|
 | `PlayerMsgConversationChance` | 30 | % chance of multi-bot reply to player message |
 | `PlayerMsgSecondBotChance` | 25 | % chance a 3rd bot joins the conversation |
+| `ChatHistoryLimit` | 10 | Recent Party transcript lines used for prompts and analysis, clamped to 1-50 |
+
+`ChatHistoryLimit` is a recent verbatim window, not a rolling summary or
+long-term bot memory. Raising it can improve short-term continuity at the cost
+of larger prompts and higher token use. Changes require a bridge restart.
 
 ---
 
@@ -1254,7 +2072,7 @@ Two shared functions avoid code triplication:
   always included), looks up traits + class/race from DB. Returns
   `(bots, traits_map, bot_guids)` or `None`.
 - `_quest_conversation_deliver()` — per-message cleanup
-  (`strip_speaker_prefix`, `cleanup_message`, 255-char clamp),
+  (`strip_speaker_prefix`, `cleanup_message`, sentence-aware 255-char limit),
   staggered delays via `calculate_dynamic_delay()`, first message
   gets action, stores chat history, marks event completed.
 
@@ -1375,6 +2193,18 @@ Talent context is invoked from:
 | `chatter_raid_base.py` | Shared BG/raid talent injection path |
 | `talent_catalog.py` | Static talent descriptions |
 
+### Gear and pet context
+
+So bots stop inventing equipment or treating their own pet as a stranger,
+prompts can carry a short line naming the speaker's equipped weapons and,
+for Hunters and Warlocks, the pet actually summoned (`character_pet`
+slot 0; stabled and dismissed pets are ignored). `build_gear_context()` in
+`chatter_shared.py` builds it in second person for solo prompts;
+`attach_speaker_gear()` / `append_speaker_gear()` add the third-person form
+per speaker in multi-speaker prompts. Emote observers also receive the
+targeted player's race, class, level and gender. Controlled by
+`LLMChatter.GearContext.Enable` (default 1).
+
 ---
 
 ## 13h. Humor Hints and Conversation Pacing
@@ -1441,6 +2271,7 @@ conversation paths (no wasted tokens).
 |---|---|---|
 | `LLMChatter.EmoteChance` | 50 | % chance emote list is included in prompt (not applied to General channel — emotes are proximity-based) |
 | `LLMChatter.ActionChance` | 10 | % chance eligible responses retain/include an action after action gating |
+| `LLMChatter.ActionAsEmote.Enable` | 1 | Deliver a line's action as a separate emote before the speech instead of inline `*action*` text (see Delivery in section 2) |
 
 ---
 
@@ -1448,29 +2279,72 @@ conversation paths (no wasted tokens).
 
 When a player performs a `/emote` (text emote), the
 `OnPlayerTextEmote` hook owned by `LLMChatterGroupCombat.cpp`
-classifies the target and routes it through the group-aware reaction
-paths below when eligible. Bot verbal reactions and observer chatter
-still require grouped bots. Direct creature mirror reactions do not.
+classifies the target and routes it through the reaction paths below when
+eligible. Grouped-bot verbal reactions and observer chatter require grouped
+bots. Direct creature and ungrouped-playerbot reactions do not.
 
-### Three reaction paths
+### Reaction paths
 
 | Path | Trigger | Behavior |
 |------|---------|----------|
-| Silent mirror | Player emotes at a group bot | Bot mirrors back a matching emote (e.g. wave to wave, rude to chicken) via `DelayedMirrorEmoteEvent` with natural timing. Per-bot cooldown `_emoteReactCooldowns` |
-| Directed verbal reaction | Player emotes at a group bot (after mirror) | Targeted bot queues a `bot_group_emote_reaction` event. Python handler builds an LLM prompt and the bot responds verbally. Per-bot cooldown `_emoteVerbalCooldowns` |
-| Observer comment | Player emotes at a creature, external player, or nobody | A random group bot queues a `bot_group_emote_observer` event. Python handler has the bot make an offhand remark about the emote. Per-group cooldown `_emoteObserverCooldowns` |
+| Silent mirror | Player emotes at a group bot | Independently rolls an 80% default chance to mirror a matching emote (e.g. wave to wave, rude to chicken) via `DelayedMirrorEmoteEvent` with natural timing. Per-bot cooldown `_emoteReactCooldowns` |
+| Directed verbal reaction | Player emotes at a group bot | Independently rolls an 80% default chance to queue a `bot_group_emote_reaction` event. Mirror-map coverage, a failed mirror roll, or an active mirror cooldown does not suppress speech. When an animation is scheduled, its name grounds the verbal prompt so speech cannot contradict it. Per-bot cooldown `_emoteVerbalCooldowns` |
+| Ungrouped playerbot mirror | Player emotes at an eligible same-team playerbot outside their group | Independently rolls an 80% default chance for mapped emotes and schedules `DelayedMirrorEmoteEvent`. It shares the existing per-bot `_emoteReactCooldowns` map with grouped mirroring |
+| Ungrouped playerbot verbal reaction | Player emotes at an eligible same-team playerbot outside their group | Independently rolls an 80% default chance, then queues `proximity_player_emote` with the addressed bot first and zero to two compatible nearby NPC/ungrouped-bot joiners. One prompt receives the original action and complete roster. The bot answers in local `/say`; `_directedBotEmoteCooldowns` is keyed by player, map, instance, and bot for twice `MirrorCooldown` |
+| Ungrouped playerbot witness reaction | The addressed ungrouped playerbot's verbal roll fails | Independently rolls a 50% default chance, then selects one or two compatible nearby NPCs/ungrouped bots. The addressed bot remains silent and outside the speaking roster, but stays in the event as structured context so every witness comments on the same player emote |
+| Directed NPC verbal reaction | Player emotes at an eligible creature | Independently rolls an 80% default chance, then queues `proximity_player_emote`. The addressed NPC always responds first; zero to two compatible NPCs can join. Per-player/NPC cooldown `_directedEmoteCooldowns`; an actually scheduled mirror animation is included in the prompt so speech cannot contradict it |
+| Observer comment | Player emotes at a creature, external player, or nobody | Independently rolls a 50% default chance for a random group bot to queue a `bot_group_emote_observer` event. Python makes the bot offer an offhand remark. Per-group cooldown `_emoteObserverCooldowns` |
+| Party observer | Player emotes at a group bot (out of combat) | Besides the target's own mirror and reply, another nearby party bot may chime in through the same observer path (`target_type: party_bot`, same chance and per-group cooldown). At `PartyObserverExchangeChance` (35% default) it becomes a two-line exchange: the observer remarks and the targeted bot answers the observer; otherwise one comment |
+| Party-bot witnesses | Player emotes at a group bot (out of combat) | Rolls `PartyBotWitnessChance` (30% default); nearby NPCs and non-party playerbots may react in `/say` through a witness-only `proximity_player_emote` scene (the party bot stays silent there, it answers in party chat). Shares `_directedBotEmoteCooldowns` under a `partybot:` key |
+| Mood spread | A contagious emote (dance, cheer, laugh, applaud, rofl, victory) at a group bot or at nobody | Each other nearby alive party bot rolls `MoodSpreadChance` (50% default) to mirror the animation, respecting its own mirror cooldown. Animation only, no chat, no LLM call |
 
 Creatures also mirror emotes directed at them via
-`DelayedCreatureMirrorEmoteEvent`. That direct mirror path is allowed
-even when the player is solo; only the observer-comment path remains
-group-gated.
+`DelayedCreatureMirrorEmoteEvent`. Creature verbal and mirror reactions
+are independent and are allowed when the player is solo; only the
+observer-comment path remains group-gated. A SmartAI text-emote rule or
+configured C++ `ReceiveEmote()` owner suppresses all module reactions for
+that creature/emote pair except an independent party-bot observer comment,
+so scripted speech, animations, and quest logic cannot be duplicated or
+contradicted. SmartAI values are matched exactly;
+an inert emote value of zero is logged and ignored rather than treated as
+a wildcard. The exclusion cache refreshes at startup and on module config
+reload. After `.reload smart_scripts`, also run `.reload config` before
+testing changed emote ownership.
+
+An ungrouped playerbot target must pass the proximity anchor, playerbot,
+same-team, range, line-of-sight, life, combat, flying, and loading checks
+before either direct outcome is attempted. Mounted targets remain eligible;
+automatic ambient selection still excludes them. Battlegrounds and arenas are
+excluded. The direct route also follows the dungeon and raid proximity-map
+settings; with global proximity chatter disabled, mapped mirroring can still
+run in the open world. Mirror, addressed-bot speech, and the conditional
+witness-scene chance are independent. The witness roll runs only when the
+addressed bot stays silent and requires at least one eligible witness. Losing
+a roll, hitting a cooldown, or configuring a chance to zero still counts as
+an accepted direct route and suppresses observer duplication.
+
+If eligibility fails, or the emote is unmapped while the verbal route is
+disabled, a grouped player retains the existing observer path. The fallback
+is deliberately passed as `EMOTE_TGT_EXT_PLAYER` so the observer prompt keeps
+the target bot's name and treats it like today's external-player target.
+
+Directed NPC conversations choose between player-inclusive dialogue and
+an NPC aside about the player's actual action. Bot-directed chains are always
+player-inclusive. Prompts forbid fabricated player speech or actions, apply
+NPC/playerbot voice rules per speaker, and identify each line's addressee for
+facing. Normal-mode playerbot actions are removed even when an NPC in the same
+response permits action narration.
 
 ### Ownership split for emote bugs
 
 - edit `LLMChatterGroupCombat.cpp` when the bug is about target
   classification, solo-vs-group gating, or which reaction path runs
 - edit `LLMChatterGroupEmote.cpp` when the bug is about mirror maps,
-  mirror cooldowns, creature/bot facing, or delayed emote execution
+  mirror cooldowns, scripted-emote ownership, creature/bot facing, or
+  delayed emote execution
+- edit `LLMChatterProximity.cpp` or `chatter_proximity.py` when the bug is
+  about directed NPC/playerbot verbal reactions or multi-NPC emote
+  conversations
 
 ### Emote coverage
 
@@ -1497,23 +2371,53 @@ are excluded from observer comments only.
 |------|------------|---------|
 | `tools/chatter_emote_reaction.py` | `bot_group_emote_reaction` | Directed verbal reaction prompt and delivery |
 | `tools/chatter_emote_observer.py` | `bot_group_emote_observer` | Observer comment prompt and delivery |
+| `tools/chatter_proximity.py` | `proximity_player_emote` | Directed NPC or ungrouped-playerbot response, including compatible mixed-speaker chains |
 
 ### Config keys
 
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `LLMChatter.EmoteReactions.Enable` | 1 | Master toggle |
-| `LLMChatter.EmoteReactions.MirrorChance` | 80 | % chance bot mirrors back the emote |
-| `LLMChatter.EmoteReactions.MirrorCooldown` | 30 | Seconds per-bot cooldown for mirroring |
-| `LLMChatter.EmoteReactions.ReactionChance` | 40 | % chance of verbal reaction after mirror |
-| `LLMChatter.EmoteReactions.ObserverChance` | 25 | % chance of observer bot commenting |
-| `LLMChatter.EmoteReactions.ObserverCooldown` | 60 | Seconds per-group cooldown for observer |
-| `LLMChatter.EmoteReactions.MoodSpreadChance` | 30 | % chance contagious emote spreads mood |
+| `LLMChatter.EmoteReactions.MirrorChance` | 80 | Independent % chance a grouped bot or NPC mirrors back the emote |
+| `LLMChatter.EmoteReactions.MirrorCooldown` | 15 | Seconds per-entity cooldown for mirroring |
+| `LLMChatter.EmoteReactions.ReactionChance` | 80 | Independent % chance of a grouped-bot verbal reaction to a directed social emote |
+| `LLMChatter.EmoteReactions.UngroupedBotMirrorChance` | 80 | Independent % chance that an eligible ungrouped bot mirrors a mapped emote |
+| `LLMChatter.EmoteReactions.UngroupedBotVerbalReactionChance` | 80 | Independent % chance that an eligible ungrouped bot answers in `/say` |
+| `LLMChatter.EmoteReactions.UngroupedBotWitnessReactionChance` | 50 | Conditional % chance of a witness-only scene when the addressed bot stays silent |
+| `LLMChatter.EmoteReactions.ObserverChance` | 50 | % chance of grouped-bot observer comment |
+| `LLMChatter.EmoteReactions.ObserverCooldown` | 30 | Seconds per-group cooldown for observer |
+| `LLMChatter.EmoteReactions.MoodSpreadChance` | 50 | % chance, per nearby party bot, that a contagious emote spreads as a mirrored animation |
+| `LLMChatter.EmoteReactions.PartyObserverExchangeChance` | 35 | % chance a party observer comment becomes a two-line exchange with the targeted bot (bridge) |
+| `LLMChatter.EmoteReactions.PartyBotWitnessChance` | 30 | % chance nearby NPCs/non-party bots witness an emote at a party bot in `/say` (server) |
+| `LLMChatter.EmoteReactions.NPCMirrorEnable` | 1 | Enable delayed NPC mirror animations |
+| `LLMChatter.EmoteReactions.NPCVerbalReactionChance` | 80 | Independent chance that a directed eligible NPC speaks |
+| `LLMChatter.EmoteReactions.NPCVerbalCooldown` | 3 | Seconds per player/NPC verbal-emote cooldown; clamped to 0-3 |
+| `LLMChatter.EmoteReactions.CxxScriptExclusionEntries` | seven known entries | C++ `ReceiveEmote()` owners suppress direct NPC reactions |
+| `LLMChatter.EmoteReactions.CustomEnable` | 1 | React to free-text `/e` and `/me` emotes |
+| `LLMChatter.EmoteReactions.CustomMaxChars` | 120 | Maximum length of a custom emote in UTF-8 characters (not bytes); longer text is cut at a character boundary |
+
+### Custom emotes
+
+Free-text emotes (`/e slowly sheathes her sword`) reach the module through
+the chat hook. The text is sanitized, clamped to `CustomMaxChars`
+characters, and aimed at the player's current target. It then follows the
+same routes as a named emote, with two differences: it never mirrors (there
+is no animation), and every payload carries the typed text plus
+`custom_emote: 1` instead of an emote id. That covers a grouped bot
+(`bot_group_emote_reaction`), group observers (`bot_group_emote_observer`),
+and an ungrouped playerbot (`proximity_player_emote`, accepted when the
+directed playerbot route is enabled). Prompts quote the text as something
+the player did (`did this directly at Aliss: "slowly sheathes her sword"`)
+rather than rendering it as a `/slash` command, and use the generic tone
+pool because free text has no emote category.
 
 ### Cooldown eviction
 
-`EvictEmoteCooldowns()` runs hourly to clean up stale entries from
-all three emote cooldown maps.
+`EvictEmoteCooldowns()` runs hourly to clean up stale entries from the four
+group-domain emote cooldown maps. Proximity scan cleanup separately evicts
+the NPC `_directedEmoteCooldowns` map using `NPCVerbalCooldown` and the bot
+`_directedBotEmoteCooldowns` map using twice `MirrorCooldown`. These maps are
+mutex-protected because text-emote hooks may run on map worker threads.
 
 ---
 
@@ -1669,7 +2573,10 @@ delivery code:
 | Helper | Purpose |
 |--------|---------|
 | `calculate_dynamic_delay(responsive=False)` | Delivery timing — skips distraction sim and uses a 2s floor when `responsive=True` |
-| `find_addressed_bot(...)` | Named-bot detection + multi-addressed intent classification via LLM |
+| `find_addressed_bot(...)` | Explicit/implicit addressee, multi-addressed intent, brief-casual scale, and optional-reply classification via LLM context analysis |
+| `should_reply_to_optional_casual(...)` | One bounded RNG roll for semantically optional brief turns; non-optional turns always pass |
+| `bound_brief_casual_response(...)` | Deterministically enforce the 8-word/50-character brief contract while preserving a usable original response and emote |
+| `build_conversational_scale_guidance(...)` | Shared instruction that keeps Guild, General, party, proximity-speech, and proximity-emote responses proportional to the player's conversational scale |
 | `should_include_action()` | Single RNG roll gating narrator action inclusion (`random.random() < get_action_chance()`). Use at conversation delivery sites instead of calling `get_action_chance()` directly to avoid double-rolling the probability |
 | `PromptParts(str)` | System/user prompt split wrapper; auto-detected by `call_llm()` |
 | `build_talent_context(...)` | Talent-aware personality context builder |
@@ -1731,12 +2638,24 @@ experiences rather than treating the player as a stranger.
      directly with `active=1` and `memory_type='first_meeting'`, guarded by
      `INSERT...SELECT...WHERE NOT EXISTS` to prevent duplicates on re-join.
      This memory is immune to both short-session discard and cap pruning.
+   - A normal join generates the visible greeting and then pre-generates the
+     farewell stored in `llm_group_bot_traits`. A player-session rejoin skips
+     the duplicate greeting but still prepares the farewell. An existing
+     persistent farewell is reused without an LLM call; a missing farewell is
+     generated before the rejoin event completes.
 
 2. **During the session** — event handlers may call `_generate_and_store_memory()`
    to produce LLM-generated memories (boss kills, notable events). These are
-   inserted with `active=0` until flush.
+   inserted with `active=0` until flush. Each memory is one plain, factual
+   first-person sentence (target 160 characters, no flowery wording).
+   `_clamp_memory_text()` enforces a 240-character hard cap at write time,
+   cutting at a sentence or word boundary, so prompts include stored
+   memories whole rather than truncating them at 200 characters.
 
 3. **Group farewell** (`process_group_farewell_event` → `flush_session_memories()`)
+   - C++ sends the prepared `llm_group_bot_traits.farewell_msg` synchronously
+     during `OnRemoveMember`, before deleting the trait row. The Python
+     farewell event does not generate the visible message.
    - If session was long enough (`SessionMinutes` threshold): activates `active=0`
      rows and prunes oldest memories to the `MaxPerBotPlayer` cap.
      `first_meeting` rows are excluded from the prune DELETE.
@@ -1826,7 +2745,7 @@ from the resulting description.
 2. Resolves zone/subzone context via existing `get_zone_name()`,
    `get_zone_flavor()`, `get_subzone_name()`, `get_subzone_lore()`,
    `get_dungeon_flavor()`, `get_time_of_day_context()`
-3. Builds bot identity via `build_bot_identity(name, race, class, gender)`
+3. Builds the playerbot identity and voice via `chatter_mode.py`
 4. Adds live travel context when present. This lets the LLM use taxi
    flight, flying mount, ground mount, swimming, or world-transport
    context while avoiding impossible ground actions.
@@ -1834,6 +2753,12 @@ from the resulting description.
    conversation (`append_conversation_json_instruction()` +
    `parse_conversation_response()`)
 6. Writes messages to `llm_chatter_messages` for C++ delivery
+
+Roleplay mode treats the vision description as what the character sees
+in-world and excludes UI/game-mechanic commentary. Normal mode treats it
+as a description of the game screenshot, allows supplied world or UI
+details to be discussed without inventing them, and responds in player
+voice rather than claiming physical presence in the scene.
 
 ### Config keys
 
@@ -1880,60 +2805,190 @@ All under `LLMChatter.Screenshot.*`:
 ## 13q. Proximity Chatter
 
 Bots and NPCs can engage in ambient `/say` conversations as the player
-moves through the world. Unlike General-channel chatter (zone-wide) or
+moves through outdoor maps, dungeons, and raids. Unlike General-channel
+chatter (zone-wide) or
 party chat (group-scoped), proximity chatter is spatially local — only
 players and bots within `/say` range (~40 yards) see it.
 
 ### Scan and trigger
 
-C++ `CheckProximityChatter()` runs on a configurable timer (default
-30s) in `LLMChatterWorld.cpp`, delegating to
-`LLMChatterProximity.cpp`:
+C++ `CheckProximityChatter(bool instanceMaps)` runs on independent
+outdoor and dungeon/raid timers in `LLMChatterWorld.cpp`, delegating to
+`LLMChatterProximity.cpp`. Older configs without scoped keys inherit the
+legacy `ScanIntervalSeconds` and `Chance` values:
 
-1. Iterates real players in the world
+1. Iterates alive, out-of-combat real players in eligible maps
 2. Scans within `ProximityChatter.ScanRadius` (default 40 yards) for
-   eligible humanoid NPCs and party bots
-3. NPC eligibility: all humanoids — guards, vendors, trainers,
-   innkeepers, quest givers, citizens, sentinels, children
+   eligible NPCs and party bots
+3. NPC eligibility follows one policy in every supported map: universal
+   life/combat/range/LOS safety checks; `SpeakerDenyEntries`;
+   boss exclusion; guards and strong interactive NPC roles; humanoids;
+   then explicitly allowlisted non-humanoid entries. Everything else is
+   rejected. This permits carefully selected friendly or hostile
+   non-humanoids without making ordinary wildlife or summons talk.
+   Creatures the player cannot detect, non-selectable or fake-dead
+   creatures, engine-marked triggers, and templates carrying the internal
+   `[DND]`/`(DND)`, `[PH]`/`(PH)`, or `[UNUSED]`/`(UNUSED)` markers are
+   always rejected so spell, event, placeholder, and encounter helpers
+   cannot speak.
+   Movement and pathing do not disqualify an otherwise eligible speaker.
 4. Bot eligibility: party bots can participate, but conversations
    where all speakers are party bots are skipped (idle chat handles
    that case)
-5. Rolls `ProximityChatter.TriggerChance` (default 30%)
+5. Rolls `OutdoorChance` or `InstanceChance` for the current map
 6. Selects 1-4 speakers from the candidate pool
 7. Queues either a `proximity_say` (single statement) or
    `proximity_conversation` (multi-speaker) event
 
 NPCs are identified by spawn GUID (`Creature::GetSpawnId()`) rather
-than entry ID, allowing per-instance entity cooldowns (default 60s).
+than entry ID. Map and instance IDs scope cooldowns, active scenes, and
+reply history so separate copies of the same dungeon cannot share
+context. Mutually hostile candidates cannot join one ambient scene.
 
 ### Delivery channels
 
-Two new delivery channels in `LLMChatterDelivery.cpp`:
+Three local delivery channels are handled by
+`LLMChatterDelivery.cpp`:
 
 | Channel | Packet | Visual |
 |---------|--------|--------|
 | `say` | `CHAT_MSG_SAY` | Normal `/say` text for bots |
 | `msay` | `CHAT_MSG_MONSTER_SAY` | NPC speech bubble |
+| `myell` | monster yell | Extended-range boss line |
 
-Speaker facing: each speaker faces the next speaker in the
-conversation sequence via `SetFacingToObject()`. NPCs have their
-orientation reset after delivery via a `BasicEvent` timer.
+Ordinary-scene facing is best effort. A speaker with only idle or random
+movement may rotate via `SetFacingToObject()`; any scripted or controlled
+movement speaks without rotation. Directed rows can identify the real
+player, bot, or NPC addressee explicitly, so NPC asides face the other NPC
+while player-inclusive lines face the player when appropriate. One facing
+lease is kept through the final queued line before the original orientation
+is restored.
 
 ### Player reply detection
 
-When a real player speaks in `/say` near a recent proximity scene,
-`HandleProximityPlayerSay()` in `LLMChatterGroupCombat.cpp` detects
-the reply and queues a `proximity_reply` event. The `ProximityScene`
-struct tracks:
+When a real player speaks in `/say`, a selected eligible NPC or same-team
+ungrouped playerbot is the addressee. Another nearby candidate overrides that
+selection only when its name is explicitly marked as a vocative with an
+adjacent comma or colon. With no selection, an unambiguous full name or
+meaningful token that is unique among nearby candidates can direct the line
+anywhere it occurs. Subnames and configurable title/place stopwords are
+excluded; ambiguous matches fail closed. A differently named candidate is the
+preferred joiner rather than automatically replacing the selected addressee.
+An ineligible cross-faction named bot falls back only to an already selected
+eligible NPC or same-team ungrouped bot; otherwise the direct route is
+suppressed. A living selected player, party bot, boss, or runtime-ineligible
+speaking NPC suppresses random fallback with a diagnostic reason. Dead and
+non-speaking targets such as corpses and critters are ignored, allowing
+normal fallback. The
+`ProximityScene` struct tracks:
 
 - active conversation participants
-- scene location and timestamp
+- map, instance, zone, and timestamp
 - the original topic context
 
-This enables natural player-to-NPC/bot exchanges without requiring
-the player to target or emote at anyone.
+This enables natural player-to-NPC/bot exchanges while making direct
+targeting authoritative when the player uses it. Every NPC-directed `/say`
+or eligible NPC emote starts with the addressed NPC, then independently
+selects zero to two additional compatible NPCs. A bot-directed `/say` or
+target-speaking emote starts with the addressed bot and selects zero to two
+compatible nearby NPCs or same-team ungrouped bots. If the addressed bot's
+emote-speech roll fails, the conditional witness roll can instead require one
+or two compatible speakers while keeping the silent target only as structured
+context. Ordinary directed scenes use `60,30,10` probabilities for zero, one,
+or two joiners. Witness-only scenes use their own `70,30` split for one or
+two speakers after the independent witness gate succeeds. A multi-NPC event
+may be player-inclusive or
+an NPC aside. Bot-directed chains are always player-inclusive, and every line
+is generated from the same original player message or action.
 
-### Topic pool
+Mixed bot-directed selection excludes joiners whose ordinary entity cooldown
+is active in memory. It deliberately does not query persisted cooldown state:
+only the first speaker's cooldown key is stored with the event, so persisted
+lookups cannot represent joiner cooldowns. The addressed `/say` target remains
+unthrottled as before; targeted emote speech retains its dedicated pair
+cooldown.
+Mounted players and mounted playerbots remain eligible for directed
+interactions and active-scene replies. Mounting continues to suppress
+automatic scenes and untargeted fallback selection. Untargeted `/say` events
+share their event types with directed `/say`, so delivery uses the presence of
+`addressed_name` to preserve that distinction if a selected speaker mounts
+after queueing. The parser accepts both compact
+`{"addressed_name":"Bob"}` and MySQL-formatted
+`{"addressed_name": "Bob"}` JSON; missing and empty values remain
+untargeted. A mounted playerbot still sends the mirrored text-emote packet,
+although the client may suppress the corresponding character animation while
+the mount is displayed. Before the delayed packet is sent, the bot is
+rechecked for combat and the player is rechecked for presence, map, and range
+so a stale mirror cannot fire after the interaction has ended.
+The same delayed event serves grouped and ungrouped bots, so grouped mirrors
+now also require the player to remain on the same map and within
+`PlayerSayScanRadius`. The execution-time radius has a one-yard minimum;
+setting the proximity scan radius to zero therefore cannot disable every
+grouped mirror silently. Grouped verbal reactions remain unaffected.
+
+### Instance and boss grounding
+
+Every ordinary proximity prompt receives the canonical DBC map name,
+map and instance IDs, zone/current-area names, and existing curated
+dungeon flavor where available. `chatter_instance_context.py` owns this
+shared normalization. NPCs also carry disposition and creature rank,
+plus their race (from the display model's `CreatureDisplayInfoExtra`
+entry, named through `ChrRaces`, so non-playable races resolve too) and
+faction affiliation (faction template to `Faction.dbc` name). Every
+proximity prompt also describes the nearby real player (level, gender,
+race, class) and, under the open sky only, the time of day with
+opportunistic season and live zone weather. `OPEN_AIR_INSTANCES` in
+`chatter_constants.py` lists the dungeons and raids fought outdoors
+(Razorfen Kraul, Zul'Farrak, Stratholme, Zul'Gurub...); party, raid and
+proximity prompts all skip time and weather in every other instance
+through `instance_has_sky()`.
+Curated non-humanoids additionally carry creature type and their
+qualification reason so the model knows that the individual can speak
+without generalizing that ability to its whole species.
+Normal-mode playerbots treat lore as game knowledge; actual NPCs always
+remain in-world speakers.
+
+Bosses use a separate path in `LLMChatterBossDialogue.cpp` instead of
+joining random ambient scenes. Automatic approach lines and explicitly
+selected/named boss replies require the player and boss to be alive,
+out of combat, in LOS, in the same dungeon/raid instance, within the
+configured boss radius, and beyond calculated aggro range plus the
+safety margin. Delivery checks those conditions again. Boss lines use
+monster yell for audibility and never change facing or threat. Automatic
+lines use a presence session shared by boss spawn and instance, rather
+than one cooldown per player. The first line follows a short random
+delay. Later speaking opportunities use random delays and a decaying
+chance that stops at a configurable floor. A failed roll schedules the
+next delayed opportunity instead of rerolling on every scanner pass.
+The boss therefore retains a small chance to speak throughout a long
+presence. Open-ended opportunities are enabled by default through an
+explicit toggle; disabling that toggle restores the optional hard cap.
+The session
+resets after no eligible player has remained nearby for the configured
+period. Recent delivered boss lines are included in later prompts to
+discourage repeats and paraphrases.
+
+Explicitly addressed `/say` replies keep their separate per-player
+cooldown and postpone the next automatic opportunity without consuming
+the automatic line allowance. Dungeon and raid miniboss qualification
+uses AzerothCore's registered creature encounters first, with boss-rank,
+boss-flag, and single-spawn immunity metadata as fallbacks for special
+encounters not present in that registry. This classifier is also used by
+group-kill chatter, so eligible registered encounters receive the existing
+guaranteed boss-kill reaction rather than normal-trash chance and cooldown
+handling. Enter-combat chatter keeps its narrower legacy classifier. Use
+`BossSpeakerDenyEntries` for encounters whose scripted presentation
+must not receive generated dialogue. Automatic checks use a fair
+round-robin schedule with one player and at most one creature-grid search
+per configured scan pass. Extended searches caused by `/say` have a
+separate per-player/map/instance throttle. During that short window,
+an unrelated line is not consumed merely because a boss remains targeted.
+A short
+boss-name match is ignored when it could refer to different nearby boss
+entries unless the selected target disambiguates it; a full name remains
+authoritative.
+
+### Topic pools
 
 `PROXIMITY_CHAT_TOPICS` in `chatter_constants.py` provides 250+
 topics across 17 categories:
@@ -1942,40 +2997,81 @@ topics across 17 categories:
   faction politics, wildlife, profession, food and drink, history,
   adventure, philosophy, humor, seasonal, and general social
 
+That pool remains the source for NPCs and roleplay-mode playerbots.
+`PROXIMITY_PLAYER_CHAT_TOPICS` supplies normal-mode playerbot `/say`
+subjects such as gameplay progress, interface/keybind observations,
+queues, routes, group needs, and light player banter. Mixed conversations
+receive separate NPC and playerbot topic angles.
+
 ### Python handling
 
-`chatter_proximity.py` owns all three event handlers:
+`chatter_proximity.py` owns the ordinary event handlers:
 
 | Event type | Handler | Behavior |
 |------------|---------|----------|
 | `proximity_say` | Single NPC or bot statement | One speaker, zone context + topic |
 | `proximity_conversation` | Multi-speaker conversation | 2-4 speakers with staggered delivery |
 | `proximity_reply` | Player reply response | NPC/bot replies to player `/say` |
+| `proximity_player_say` | Directed/nearby response | One addressed NPC or ungrouped playerbot replies |
+| `proximity_player_conversation` | Directed nearby exchange | Addressed NPC or ungrouped playerbot plus selected compatible joiners |
+| `proximity_player_emote` | Directed social emote | Addressed NPC/playerbot response with optional joiners, or a witness-only scene that preserves a silent bot target as context |
 
-Prompts include nearby entity names so speakers can address each other
-by name. Uses global `EmoteChance` and `ActionChance` gates (not custom
-proximity-specific ones).
+`chatter_boss_dialogue.py` owns `proximity_boss_approach` and
+`proximity_boss_player_say`. Both produce one message-only `myell` row
+tagged with `owner_subsystem='boss_dialogue'`.
+
+Player-responsive proximity prompts use the shared conversational-scale
+guidance. Short casual speech receives a short casual answer, and a simple
+social emote receives a lightweight reaction rather than a monologue or a
+new topic. The generation model judges player speech semantically; the bridge
+does not maintain a phrase list. Semantically brief speech uses the shared
+2-8-word / 50-character hard limit and one strict rewrite attempt. A valid
+structured emote may be the entire local party/proximity speech reaction only
+when that turn is classified `brief_casual`. Explicit player-emote events may
+also produce emote-only output, but keep their existing server reaction chance
+and are not put through the optional-reply RNG or hard repair gate. Python
+stores an empty message plus the emote, and C++ plays the emote without sending
+an empty chat packet. Invalid emote names are dropped terminally, and party
+emotes in battlegrounds retain the combat-emote allowlist. Guild uses a short
+visible third-person narrator action for the equivalent remote reaction;
+General continues to use short textual replies.
+
+Prompts include up to four distinct nearby entity names so speakers can
+address each other without repeating identical names. One conversation
+also selects at most one speaker with a given display name because the
+response contract identifies speakers by name. Directed parsing accepts
+only exact names or unique tokens, validates an optional `addressee`, and
+falls back to the addressed speaker if the conversation output is invalid or
+inserts no usable lines.
+Roster entries identify each participant as `NPC` or
+`PLAYERBOT`; the prompt keeps NPCs in-world and applies ChatterMode only
+to playerbots. Uses global `EmoteChance` and `ActionChance` gates (not
+custom proximity-specific ones).
 
 ### C++ ownership
 
 | File | Responsibility |
 |------|----------------|
-| `LLMChatterProximity.cpp` | Scan, filter, select, queue, scene tracking |
+| `LLMChatterProximity.cpp` | Scan, filter, directed name resolution, joiner selection, queue, scene/cooldown tracking |
 | `LLMChatterProximity.h` | Declarations for world and group combat |
-| `LLMChatterDelivery.cpp` | `say` and `msay` channel delivery, facing, NPC reset |
-| `LLMChatterWorld.cpp` | Timer delegation |
-| `LLMChatterGroupCombat.cpp` | `HandleProximityPlayerSay()` hook |
-| `LLMChatterShared.cpp` | `FindCreatureBySpawnId()`, `GetCreatureRoleName()` |
-| `LLMChatterConfig.h/.cpp` | 15 proximity config members |
+| `LLMChatterBossDialogue.cpp/.h` | Staggered boss safe-band scan, unambiguous direction, synchronized state |
+| `LLMChatterDelivery.cpp` | Delivery, drop diagnostics/cancellation, addressee-facing, and live revalidation |
+| `LLMChatterWorld.cpp` | Delegates staggered boss scan scheduling |
+| `LLMChatterGroupCombat.cpp` | Player `/say` and directed text-emote hooks |
+| `LLMChatterGroupEmote.cpp` | Mirror reactions and scripted-emote exclusion cache |
+| `LLMChatterShared.cpp` | Creature lookup/role and shared boss cache/classifier |
+| `LLMChatterConfig.h/.cpp` | Ordinary and boss proximity configuration |
 
 ### Python ownership
 
 | File | Responsibility |
 |------|----------------|
-| `chatter_proximity.py` | All 3 event handlers and prompt builders |
+| `chatter_proximity.py` | Ordinary/directed handlers, prompts, strict parser, and addressed history |
+| `chatter_instance_context.py` | Shared instance location/lore grounding |
+| `chatter_boss_dialogue.py` | Safe one-line boss prompt and `myell` insertion |
 | `chatter_constants.py` | `PROXIMITY_CHAT_TOPICS` (250+ entries) |
-| `chatter_db.py` | `npc_spawn_id` and `player_guid` params on insert |
-| `chatter_event_registry.py` | 3 new `EventSpec` entries |
+| `chatter_db.py` | Speaker, player, drop, and explicit addressee message fields |
+| `chatter_event_registry.py` | Ordinary and boss event routing |
 
 ### Config keys
 
@@ -1984,20 +3080,50 @@ All under `LLMChatter.ProximityChatter.*`:
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `Enable` | 1 | Master toggle |
-| `CheckIntervalSeconds` | 30 | Scan timer interval |
+| `EnableInDungeons` | 1 | Allow ordinary proximity in dungeons |
+| `EnableInRaids` | 1 | Allow ordinary proximity in raids |
+| `ScanIntervalSeconds` | 30 | Compatibility fallback for missing scoped intervals |
+| `OutdoorScanIntervalSeconds` | 30 | Ordinary outdoor scan timer interval |
+| `InstanceScanIntervalSeconds` | 30 | Ordinary dungeon/raid scan timer interval |
 | `ScanRadius` | 40 | Yards around player to scan |
-| `TriggerChance` | 30 | % chance per scan per player |
-| `ConversationChance` | 50 | % multi-speaker vs single statement |
-| `EntityCooldown` | 60 | Seconds per-entity (spawn GUID) cooldown |
-| `PlayerAddressChance` | 20 | % chance to address the real player |
-| `MaxSpeakers` | 4 | Maximum speakers per conversation |
-| `LineDelayMin` | 3 | Min seconds between conversation lines |
-| `LineDelayMax` | 5 | Max seconds between conversation lines |
-| `ReplyWindowSeconds` | 60 | How long a scene stays active for replies |
-| `ReplyChance` | 80 | % chance to reply when player speaks in scene |
-| `MaxTopicLength` | 0 | Max topic hint length (0 = no limit) |
-| `NPCOnly` | 0 | When 1, only NPCs speak (no party bots) |
-| `ListenRange` | 40 | `/say` audibility range (should match ScanRadius) |
+| `PlayerSayScanRadius` | 40 | New-scene `/say` response radius |
+| `DirectedMaxExtraReactors` | 2 | Global maximum directed joiners, clamped to 0-2 |
+| `DirectedBotMaxParticipants` | 3 | Total involved AI entities in a bot-directed chain, including a speaking or silent addressed bot; clamped to 1-3 |
+| `DirectedExtraReactorWeights` | 60,30,10,0 | Weights for 0-3 joiner slots; the universal two-joiner cap keeps the final slot at zero; values must strictly descend and total 100 |
+| `DirectedWitnessReactorWeights` | 70,30 | Weights for one or two speakers in a witness-only emote scene; must strictly descend and total 100 |
+| `DirectedNPCAsideChance` | 35 | % chance a multi-NPC event is an NPC aside |
+| `DirectedMaxLines` | 5 | Maximum directed conversation lines |
+| `DirectedExpirySeconds` | 30 | Short expiry for directed say, active-scene reply, and emote work |
+| `DirectedNameStopwords` | titles and places | Tokens excluded from short-name addressing |
+| `SpeakerAllowEntries` | empty | Explicitly approved non-humanoid creature entries |
+| `SpeakerDenyEntries` | empty | Ordinary speaker exclusions; overrides all qualifications |
+| `Chance` | 30 | Compatibility fallback for missing scoped chances |
+| `OutdoorChance` | 30 | % chance per eligible outdoor scan |
+| `InstanceChance` | 100 | % chance per eligible dungeon/raid scan |
+| `ConversationChance` | 40 | % multi-speaker vs single statement |
+| `EntityCooldown` | 3 | Seconds per-entity (spawn GUID) cooldown; clamped to 0-3 |
+| `PlayerAddressChance` | 30 | % chance to address the real player |
+| `MaxConversationLines` | 4 | Maximum ambient lines |
+| `ConversationLineDelay` | 2 | Seconds between lines |
+| `ReplyWindowSeconds` | 30 | How long a scene accepts replies |
+| `ReplyMaxTurns` | 5 | Maximum tracked scene turns |
+| `EnableBossDialogue` | 0 | Boss path; enable for controlled testing |
+| `BossApproachCheckIntervalSeconds` | 2 | Interval between one-player round-robin scan passes |
+| `BossApproachMaxRadius` | 80 | Extended boss detection/yell radius |
+| `BossAggroSafetyMargin` | 0 | Extra yards required beyond live aggro range |
+| `BossInitialDelayMinSeconds` | 2 | Minimum delay before the guaranteed first automatic line |
+| `BossInitialDelayMaxSeconds` | 6 | Maximum delay before the guaranteed first automatic line |
+| `BossRepeatDelayMinSeconds` | 20 | Minimum delay between later automatic opportunities |
+| `BossRepeatDelayMaxSeconds` | 60 | Maximum delay between later automatic opportunities |
+| `BossRepeatChance` | 80 | Chance that the second automatic opportunity speaks |
+| `BossRepeatChanceDecayPercent` | 50 | Multiplier applied to each later repeat chance |
+| `BossRepeatChanceFloor` | 10 | Persistent minimum repeat chance after decay |
+| `BossUnlimitedAutomaticLines` | 1 | Keep randomized opportunities open-ended |
+| `BossMaxAutomaticLines` | 3 | Cap used only when unlimited mode is disabled; zero then disables automatic lines |
+| `BossPresenceResetSeconds` | 90 | Eligible-player absence needed to begin a new presence |
+| `BossDirectedReplyCooldownSeconds` | 3 | Directed reply cooldown; clamped to 0-3 seconds |
+| `BossDirectedScanCooldownSeconds` | 1 | Per-player/map/instance `/say` search throttle |
+| `BossSpeakerDenyEntries` | empty | Comma-separated excluded boss entries |
 
 ### Schema changes
 
@@ -2011,12 +3137,60 @@ Migration `20260403_proximity_chatter.sql` adds two columns to
 
 Base schema `00000000_llm_chatter_tables.sql` updated to match.
 
+Migration `20260914_npc_multidirectional_interactions.sql` adds
+`proximity_player_emote`, `drop_reason`, and the three nullable addressee
+columns (`addressee_player_guid`, `addressee_bot_guid`, and
+`addressee_npc_spawn_id`). A consumed row still sets `delivered = 1`;
+successful speech has a null `drop_reason`, while failed delivery records a
+specific reason. Addressed history excludes dropped rows, includes the
+player's stored line, and stays scoped to the same addressed NPC, map, and
+instance. A dropped line in a directed event cancels its remaining lines.
+Apply this migration before starting a bridge or worldserver binary that
+contains the new message insert and delivery queries.
+
+Migration `20260908_instance_proximity_boss_events.sql` extends the
+`llm_chatter_events.event_type` enum with `proximity_boss_approach`
+and `proximity_boss_player_say`. Existing installations require this
+migration before boss dialogue can be enabled. Fresh installs receive
+the event types from the base schema.
+
 ---
+
+### Duel and PvP onlookers
+
+Bots outside the player's group can react to a nearby duel or
+overworld PvP kill (`LLMChatterProximityFight.cpp`). The rules favour
+restraint:
+
+- Each duel gets one moment (before, during, or after), occasionally
+  two, rarely three (`SecondMomentChance`, `ThirdMomentChance`). A PvP
+  kill is a single moment.
+- Each moment gets one reaction: a statement or a 2-3 bot conversation
+  (`ConversationChance`), from one pool. Bots the player can read (same
+  faction) speak through the normal proximity events with a fight topic;
+  opposite-faction bots only emote (for example applaud or bow after a
+  duel, cheer or threaten after a kill).
+- Onlookers exclude the fighters and the player's group. Same-faction
+  speakers must perceive every fighter they may name
+  (`IsUnitPerceivableBy()`), so stealthed fighters stay unnamed.
+- Chances (`DuelChance`, `PvPChance`) are scaled by proximity zone
+  fatigue; `SceneCooldownSeconds` (per anchor and `SceneCellYards`
+  cell) throttles repeated scenes. Bots on their proximity entity
+  cooldown are excluded before the reaction shape is chosen, and every
+  roster member's cooldown is marked together.
+- One onlooker policy (`IsProximityFightOnlookerEligible()`) is applied
+  at selection and again before each staggered emote, so an emote is
+  skipped if the anchor or onlooker no longer qualifies.
+- Lines are revalidated at delivery against the live duel, so a line for
+  a cancelled challenge, a finished duel, or a rematch is dropped.
+
+Settings live under `LLMChatter.ProximityChatter.FightReactions.*`.
 
 ## 13r. Guild Chat Statements and Conversations
 
-Guild chatter is an optional, RP-only ambient channel. It is enabled
-by default and can be disabled with the master toggle.
+Guild chatter is an optional ambient channel. It is enabled by default,
+can be disabled with the master toggle, and follows the configured
+playerbot chatter mode.
 
 ### Trigger and participant ownership
 
@@ -2047,8 +3221,8 @@ are interpreted as legacy statements.
 
 ### Topic and prompt policy
 
-`chatter_guild.py` selects one entry from
-`GUILD_CHAT_TOPICS_RP` for the whole event. A single
+`chatter_guild.py` selects one entry from `GUILD_CHAT_TOPICS` in normal
+mode or `GUILD_CHAT_TOPICS_RP` in roleplay mode for the whole event. A single
 `GuildChatter.ZoneNameChance` roll also applies to the whole event.
 
 A separate `GuildChatter.HistoryContextChance` roll decides whether
@@ -2200,6 +3374,55 @@ An explicitly addressed bot is the primary responder. Otherwise,
 recent speakers receive a soft configurable weight penalty so the same
 Guild member does not dominate every exchange.
 
+The same LLM intent pass can resolve an implicit addressee from the recent
+transcript, such as a player naturally answering the immediately prior
+speaker without repeating their name. If the model returns no addressee for
+a non-group turn, the bridge falls back to the eligible bot immediately
+before the current player line in the visible session transcript. It also
+marks brief casual continuations semantically. A brief continuation directed
+to one bot stays
+with that responder when a reply is warranted, bypasses the recent-speaker
+penalty, and suppresses callback, player-name, and follow-up-question
+embellishments.
+The shared prompt guidance then requires a few casual words or one short
+sentence instead of developed prose. General, party, and proximity player
+responses use the same scale-matching guidance.
+
+Player-message analysis judges what the turn invites using its meaning and
+recent history, never an input-length threshold or phrase list. A terse
+invitation for news, advice, an experience, or an explanation can deserve a
+concrete answer. Acknowledgments and conversational closure remain brief.
+The existing `brief_casual` and `requires_reply` decisions stay separate.
+Reply necessity is judged from the whole exchange: silence is eligible only
+when the turn clearly needs no further engagement. If silence would feel
+like ignoring an ongoing contribution, or the intent is uncertain, the model
+is instructed to favor a short acknowledgment unless the purpose clearly
+calls for detail. A casual or
+declarative message does not by itself signal conversational closure.
+Channel length guidance and hard limits still apply; useful detail is
+permitted, never mandatory, and replies should not be padded.
+
+General reuses its configurable nonbrief length weights after classification.
+Brief turns retain their existing limits and optional-silence policy; Party
+continues to bypass optional silence. No additional LLM call is introduced.
+
+The intent pass also marks `requires_reply`: every question requires a reply,
+while statements are judged semantically in conversational context. The bridge
+derives `reply_optional` only for a brief casual statement that the model says
+does not require a reply. Guild, General, proximity-speech, and directed
+boss-speech handlers then roll
+`LLMChatter.PlayerChat.OptionalCasualReplyChance` once before generation.
+The default 20% reply chance makes silence the common result without suppressing
+questions, requests, warnings, important information, or other turns that
+clearly expect engagement. No phrase, punctuation, or keyword list is used.
+A failed roll skips the event without a generation call; a successful optional
+turn uses one responder. Party player messages
+bypass this silence roll and always continue to a concise response once queued.
+If the strict rewrite still exceeds the brief contract, Party deterministically
+bounds each selected speaker's usable result rather than dropping the statement
+or conversation. Casual multi-addressee messages therefore retain the forced
+conversation path and every selected responder.
+
 The conversation roll remains independent and runs first. If it fails,
 the bridge rolls the independent multi-reply chance. A message clearly
 addressed to several guildmates receives a configurable bonus to that
@@ -2259,6 +3482,8 @@ response path used by other chatter.
 | `PlayerReplies.RecentSpeakerPenalty` | 60 | Bridge | Recent-speaker weight reduction |
 | `PlayerReplies.FirstDelayMin` | 8 | Bridge | Minimum first reply delay |
 | `PlayerReplies.FirstDelayMax` | 20 | Bridge | Maximum first reply delay |
+| `PlayerChat.OptionalCasualReplyChance` | 20 | Bridge | Shared reply chance for semantically optional brief turns |
+| `PlayerChat.BriefCasualLengthWeights` | 35,45,20 | Bridge | General brief casual reply length weights: tiny (1-4 words), short (2-8), relaxed (5-14); a follow-up bot picks a different tier |
 | `SessionMemory.Enable` | 1 | Bridge | Include and compact session memory |
 | `SessionMemory.SummaryThresholdChars` | 3500 | Bridge | Compaction threshold |
 | `SessionMemory.SummaryMaxInputChars` | 8000 | Bridge | Per-call transcript input cap |
@@ -2336,7 +3561,7 @@ One LLM request generates the complete greeting sequence. Prompts:
 - ask for one distinct 3-12-word greeting per selected bot
 - forbid bot-to-bot conversation
 - forbid invented absence length, destination, or player intent
-- retain the normal Guild cross-zone and RP-only rules
+- retain the normal Guild cross-zone and configured chatter-mode rules
 - allow only the primary greeter to be asked to use the player's name
 - enforce `LoginGreeting.MaxCharacters` after cleanup
 
@@ -2431,9 +3656,9 @@ Typical multi-message JSON shape:
 
 | Table | Producer | Consumer | Purpose |
 |---|---|---|---|
-| `llm_chatter_events` | C++ | Python | Event queue |
-| `llm_chatter_queue` | C++ | Python | Ambient request queue |
-| `llm_chatter_messages` | Python | C++ | Outbound delivery queue (includes `npc_spawn_id` for NPC speakers and `player_guid` for proximity scene tracking) |
+| `llm_chatter_events` | C++ | Python | Event queue, including actual bot-loot snapshots |
+| `llm_chatter_queue` | C++ | Python | Ambient request queue with server-selected `message_type` and optional `item_context` |
+| `llm_chatter_messages` | Python | C++ | Outbound delivery queue with speaker/player IDs, explicit directed-line addressees, and drop diagnostics |
 | `llm_group_cached_responses` | Python | C++ | Pre-cached instant reactions |
 | `llm_group_bot_traits` | Python + C++ travel refresh | Python | Group personality, location, and live travel state |
 | `llm_group_chat_history` | Python | Python | Group anti-repetition history |
@@ -2462,6 +3687,8 @@ constructor's `enabledHooks` vector or it will silently never fire.
 
 - `LLMChatterDelivery.cpp` for outbound delivery logic
 - `LLMChatterAmbient.cpp` for ambient world/event logic
+- `LLMChatterLoot.cpp` for real General loot capture and aggregation
+- `LLMChatterTrade.cpp` for live ambient seller inventory snapshots
 - `LLMChatterNearby.cpp` for nearby scan logic
 - `LLMChatterProximity.cpp` for proximity chatter scan and scene logic
 - `LLMChatterWorld.cpp` for world transport/dispatcher logic

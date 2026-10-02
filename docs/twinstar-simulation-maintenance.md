@@ -1,8 +1,9 @@
 # Upstream maintenance
 
-Origin remains the original Hokken repository. Nothing was pushed. The fork starts from the server's
-installed master commit, not a speculative latest API. The parent AzerothCore and mod-playerbots repos
-are unchanged. Custom launcher/log and name-data files were excluded from all commits.
+Origin remains the original Hokken repository. The simulation branch is published in
+`JurajKralik/mod-llm-chatter`, with companion changes in `JurajKralik/mod-playerbots`.
+Custom launcher/log and name-data files are excluded from commits. The server still runs the
+previously installed binary until an explicit build and deployment.
 
 ## Patched upstream files
 
@@ -54,3 +55,33 @@ MySQL temporary tables. Do not rewrite unrelated formatting or persistent SQL to
 Before deployment, verify the real follow/resume loop, stop/restart behavior, observer departure during
 LLM latency, two nearby observers, independent remote contexts, and restoration of legacy mode. The
 initial milestone has not yet passed those live gameplay checks and is not production-complete.
+
+## Upstream integration (2026-10-02)
+
+Merged Hokken master `9cbeb13` into the simulation branch. This imports provider compatibility,
+shared personas, conversation threads, responsive player replies, richer proximity/PvP/duel
+context, and Arathi Basin grounding. These legacy features remain subject to the simulation
+coordinator's ownership gates; importing them does not enable parallel legacy speech.
+
+Resolved the proximity API change (`CheckProximityChatter(bool instanceMaps)`) and scan timer
+rename while preserving the simulation scanner. Refreshed CMake once to collect new upstream
+source files. Upstream extracted event SQL construction into a string-returning helper;
+simulation suppression now guards both event enqueue entry points, not that helper.
+The Arathi snapshot test disables personality spice sampling when comparing snapshot-independent
+prompts because upstream now remembers recently used spices.
+
+PlayerBots master `037c0141` was inspected. Full promotion requires core APIs absent from the
+installed core (`ModuleDatabasePool.h`, `DatabaseScript::OnModuleDatabasesLoading`). Seven
+independent fixes were cherry-picked, preserving original authors and commit references:
+`a22a11c2`, `7e9de982`, `9f13694c`, `c336f9b8`, `bf6190b2`, `7fcc0ffa`, `4517bfcf`.
+The bounded social follow, conversation hold and walk-on-invite customizations remain present.
+
+Before deployment, back up the character database, review upstream dated SQL updates and runtime
+`ensure_tables` changes, then compile against the paired core and run gameplay acceptance. No SQL
+updates or service restart were performed during this source integration. Newly imported persona,
+thread and battleground features are not yet routed into the custom simulation coordinator.
+
+Validation: 524 pytest cases and 37 subtests passed (11 database cases skipped in that run);
+all 22 simulation unittest cases subsequently passed with session-local temporary MySQL tables.
+PlayerBots module C++ codestyle passed. Chatter/core linters report upstream style issues;
+the core SQL checker cannot fetch because core Git metadata is read-only.

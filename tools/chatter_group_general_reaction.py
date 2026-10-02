@@ -23,6 +23,10 @@ from chatter_group_state import (
     format_chat_history,
     get_group_player_name,
 )
+from chatter_mode import (
+    build_player_chat_guidance,
+    build_player_prompt_header_from_dict,
+)
 from chatter_shared import (
     append_conversation_json_instruction,
     append_json_instruction,
@@ -35,6 +39,7 @@ from chatter_shared import (
     get_class_name,
     get_dungeon_flavor,
     get_gender_label,
+    get_race_faction,
     get_race_name,
     get_subzone_lore,
     get_subzone_name,
@@ -46,6 +51,7 @@ from chatter_shared import (
     parse_single_response,
     strip_conversation_actions,
     strip_speaker_prefix,
+    shorten_chat_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,6 +81,21 @@ def _relay_enabled(config: dict) -> bool:
     )).strip() == '1'
 
 
+def _character_faction(db, guid: int) -> str:
+    if not guid:
+        return ''
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT race FROM characters WHERE guid = %s",
+        (guid,),
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    return get_race_faction(
+        row.get('race') if row else None
+    )
+
+
 def _fetch_group_candidates(
     db,
     zone_id: int,
@@ -82,6 +103,12 @@ def _fetch_group_candidates(
     source_bot_guid: int,
 ) -> List[Dict]:
     """Return active group candidates in the source zone."""
+    source_faction = _character_faction(
+        db, source_bot_guid
+    )
+    if not source_faction:
+        return []
+
     cursor = db.cursor(dictionary=True)
     cursor.execute("""
         SELECT t.group_id, t.bot_guid, t.bot_name,
@@ -110,9 +137,19 @@ def _fetch_group_candidates(
 
     candidates = []
     for group_id, bots in grouped.items():
+        player_guid = get_real_player_guid_for_group(
+            db, group_id
+        )
+        player_faction = _character_faction(
+            db, player_guid
+        )
+        if player_faction != source_faction:
+            continue
         responders = [
             b for b in bots
             if int(b.get('bot_guid') or 0) != source_bot_guid
+            and get_race_faction(b.get('race'))
+            == player_faction
         ]
         if responders:
             candidates.append({
@@ -316,6 +353,15 @@ def _row_to_bot(row: Dict) -> Dict:
 
 
 def _fetch_group_bots(db, group_id: int, source_bot_guid: int) -> List[Dict]:
+    source_faction = _character_faction(
+        db, source_bot_guid
+    )
+    player_faction = _character_faction(
+        db, get_real_player_guid_for_group(db, group_id)
+    )
+    if not source_faction or player_faction != source_faction:
+        return []
+
     cursor = db.cursor(dictionary=True)
     cursor.execute("""
         SELECT t.bot_guid, t.bot_name,
@@ -332,7 +378,11 @@ def _fetch_group_bots(db, group_id: int, source_bot_guid: int) -> List[Dict]:
     """, (group_id, source_bot_guid))
     rows = cursor.fetchall()
     cursor.close()
-    return [_row_to_bot(r) for r in rows]
+    return [
+        _row_to_bot(row) for row in rows
+        if get_race_faction(row.get('race'))
+        == player_faction
+    ]
 
 
 def _fetch_source_bot_info(db, source_bot_guid: int) -> Dict:
@@ -373,9 +423,7 @@ def _ensure_source_name(
 
 
 def _clamp_message(message: str) -> str:
-    if len(message) > 255:
-        return message[:252] + "..."
-    return message
+    return shorten_chat_message(message)
 
 
 def _first_delay(extra_data: Dict) -> float:
@@ -422,19 +470,22 @@ def _build_statement_prompt(
         ] if t
     )
     prompt = (
-        f"{bot['name']} is a level {bot['level']} "
-        f"{bot['race']} {bot['class']} in a party "
-        f"with {player_name}.\n"
+        f"{build_player_prompt_header_from_dict(bot, mode)}\n"
+        f"You are in a party with {player_name}.\n"
     )
     if traits:
         prompt += f"Personality traits: {traits}.\n"
     if bot.get('travel_context'):
-        prompt += f"{bot['travel_context']}\n"
-    if loc.get('dungeon_flavor'):
+        label = (
+            "Travel context"
+            if is_rp else "Character gameplay travel state"
+        )
+        prompt += f"{label}: {bot['travel_context']}\n"
+    if is_rp and loc.get('dungeon_flavor'):
         prompt += f"Dungeon context: {loc['dungeon_flavor']}\n"
-    elif loc.get('zone_flavor'):
+    elif is_rp and loc.get('zone_flavor'):
         prompt += f"Zone context: {loc['zone_flavor']}\n"
-    if loc.get('subzone_lore'):
+    if is_rp and loc.get('subzone_lore'):
         prompt += f"Subzone context: {loc['subzone_lore']}\n"
     if chat_hist:
         prompt += f"{chat_hist}\n"
@@ -457,6 +508,7 @@ def _build_statement_prompt(
         "General reply.\n"
         f"HARD RULE: The message text must mention "
         f"{source_bot['name']} by name.\n"
+        "HARD LIMIT: Never exceed 150 characters total.\n"
     )
     if is_rp:
         prompt += (
@@ -464,10 +516,7 @@ def _build_statement_prompt(
             "Keep it natural, brief, and grounded.\n"
         )
     else:
-        prompt += (
-            "Sound like a normal WoW player. Keep it "
-            "brief and casual.\n"
-        )
+        prompt += "Keep it brief and natural.\n"
     return append_json_instruction(
         prompt,
         allow_action=is_rp,
@@ -490,6 +539,8 @@ def _build_conversation_prompt(
         f"{len(bots)} grouped bots reacting to something "
         "they just heard in General chat.\n"
     )
+    if not is_rp:
+        prompt += build_player_chat_guidance(mode, 'party') + "\n"
     prompt += (
         f"\nA bot named {source_bot['name']} just said "
         f"in General chat:\n\"{source_message}\"\n"
@@ -498,12 +549,13 @@ def _build_conversation_prompt(
         f"\nThe first party line must mention "
         f"{source_bot['name']} by name. This is private "
         "party chat, not another General reply.\n"
+        "HARD LIMIT: Never exceed 150 characters in any message.\n"
     )
-    if loc.get('dungeon_flavor'):
+    if is_rp and loc.get('dungeon_flavor'):
         prompt += f"Dungeon context: {loc['dungeon_flavor']}\n"
-    elif loc.get('zone_flavor'):
+    elif is_rp and loc.get('zone_flavor'):
         prompt += f"Zone context: {loc['zone_flavor']}\n"
-    if loc.get('subzone_lore'):
+    if is_rp and loc.get('subzone_lore'):
         prompt += f"Subzone context: {loc['subzone_lore']}\n"
 
     prompt += "\nSpeakers:\n"
@@ -522,7 +574,11 @@ def _build_conversation_prompt(
         if traits:
             line += f"; traits: {traits}"
         if bot.get('travel_context'):
-            line += f"; {bot['travel_context']}"
+            label = (
+                "travel context"
+                if is_rp else "character gameplay travel state"
+            )
+            line += f"; {label}: {bot['travel_context']}"
         prompt += line + "\n"
 
     if chat_hist:
@@ -534,10 +590,7 @@ def _build_conversation_prompt(
             "and class; keep it grounded and brief.\n"
         )
     else:
-        prompt += (
-            "\nGuidelines: Sound like normal people "
-            "chatting in a game; keep it brief.\n"
-        )
+        prompt += "\nGuidelines: Keep it brief and natural.\n"
     prompt += (
         f"- {names[0]} speaks first and mentions "
         f"{source_bot['name']} by name\n"

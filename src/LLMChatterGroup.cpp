@@ -79,26 +79,6 @@ namespace
     char const* const kMultiBotProtocolVersion = "1";
     char const kMultiBotSeparator = '~';
 
-    // Upstream AzerothCore renamed creature.id1 -> creature.id
-    // (PR #25197, migration 2026_06_16_00). Resolve the column
-    // name once (lazy, thread-safe magic static) so our SQL
-    // works on both the old and updated core source.
-    std::string const& GetCreatureEntryColumn()
-    {
-        static std::string const column = []() -> std::string
-        {
-            if (QueryResult r = WorldDatabase.Query(
-                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
-                    "WHERE TABLE_SCHEMA = 'acore_world' "
-                    "AND TABLE_NAME = 'creature' "
-                    "AND COLUMN_NAME IN ('id', 'id1') "
-                    "ORDER BY (COLUMN_NAME = 'id') DESC LIMIT 1"))
-                return (*r)[0].Get<std::string>();
-            return "id";
-        }();
-        return column;
-    }
-
     std::string TrimMultiBot(std::string const& value)
     {
         size_t start = value.find_first_not_of(" \t\r\n");
@@ -756,10 +736,33 @@ bool GroupHasRealPlayer(Group* group)
 // Pick a random bot from the group, optionally
 // excluding a specific player (e.g. the killer)
 Player* GetRandomBotInGroup(
-    Group* group, Player* exclude)
+    Group* group, Player* exclude,
+    bool requireAlive)
 {
     if (!group)
         return nullptr;
+
+    // BG raid: party chat only reaches the speaker's
+    // subgroup, so only bots sharing the real player's
+    // subgroup can be heard.
+    bool scopeToSubGroup = false;
+    uint8 realSubGroup = 0;
+    if (group->isBGGroup())
+    {
+        for (GroupReference* itr =
+                 group->GetFirstMember();
+             itr != nullptr; itr = itr->next())
+        {
+            Player* member = itr->GetSource();
+            if (member && !IsPlayerBot(member))
+            {
+                realSubGroup = group->GetMemberGroup(
+                    member->GetGUID());
+                scopeToSubGroup = true;
+                break;
+            }
+        }
+    }
 
     std::vector<Player*> bots;
     for (GroupReference* itr =
@@ -769,7 +772,11 @@ Player* GetRandomBotInGroup(
         Player* member = itr->GetSource();
         if (member && IsPlayerBot(member)
             && member != exclude
-            && member->IsAlive())
+            && (!requireAlive || member->IsAlive())
+            && (!scopeToSubGroup
+                || group->GetMemberGroup(
+                       member->GetGUID())
+                    == realSubGroup))
             bots.push_back(member);
     }
 
@@ -826,9 +833,6 @@ std::unordered_map<uint64, time_t>
 std::unordered_map<uint64, time_t>
     _questCompleteCd;
 
-// -- Named boss entries --
-std::unordered_set<uint32> _namedBossEntries;
-
 // -- Per-group cooldown maps --
 std::map<uint32, time_t> _groupKillCooldowns;
 std::map<uint32, time_t> _groupDeathCooldowns;
@@ -867,6 +871,7 @@ std::unordered_map<uint32, time_t>
     _emoteVerbalCooldowns;
 std::unordered_map<uint32, time_t>
     _creatureEmoteCooldowns;
+std::mutex _emoteCooldownMutex;
 
 // Group cooldown maps below, plus
 // _questAcceptTimestamps, preserve the pre-split
@@ -874,45 +879,9 @@ std::unordered_map<uint32, time_t>
 // PlayerScript, GroupScript, and CreatureScript
 // hook paths mutate them on map update threads,
 // and the world flush path does not access them.
-// If this module must support cross-map concurrent
-// writes under MapUpdate.Threads > 1, these maps
-// need explicit synchronization rather than more
-// shared callers.
-
-// ============================================================================
-// NAMED BOSS CACHE
-// ============================================================================
-
-void LoadNamedBossCache()
-{
-    _namedBossEntries.clear();
-    // Named bosses: CreatureImmunitiesId > 0 and
-    // only 1 spawn on their map (filters out trash
-    // like Molten Elementals that have immunities
-    // but spawn many times)
-    std::string query =
-        "SELECT entry FROM ("
-        "  SELECT ct.entry, ct.`rank`,"
-        "    ct.CreatureImmunitiesId,"
-        "    COUNT(*) AS spawns"
-        "  FROM creature_template ct"
-        "  JOIN creature c ON c." + GetCreatureEntryColumn() + " = ct.entry"
-        "  WHERE ct.`rank` = 3"
-        "    OR ct.CreatureImmunitiesId > 0"
-        "  GROUP BY ct.entry, c.map"
-        "  HAVING ct.`rank` = 3 OR COUNT(*) = 1"
-        ") AS bosses";
-    QueryResult result = WorldDatabase.Query(query);
-    if (result)
-    {
-        do
-        {
-            Field* fields = result->Fetch();
-            _namedBossEntries.insert(
-                fields[0].Get<uint32>());
-        } while (result->NextRow());
-    }
-}
+// Emote cooldown access is synchronized in
+// LLMChatterGroupEmote.cpp because text emotes can
+// run concurrently on map update threads.
 
 // ============================================================================
 // PLAYERBOT COMMAND FILTER
@@ -928,12 +897,12 @@ bool IsLikelyPlayerbotControlCommand(
     auto trim = [](std::string const& input)
     {
         size_t start =
-            input.find_first_not_of(" \t\n\r");
+            input.find_first_not_of(" \t\n\r\f\v");
         if (start == std::string::npos)
             return std::string();
 
         size_t end =
-            input.find_last_not_of(" \t\n\r");
+            input.find_last_not_of(" \t\n\r\f\v");
         return input.substr(start, end - start + 1);
     };
 
@@ -952,6 +921,165 @@ bool IsLikelyPlayerbotControlCommand(
     std::string msg = toLowerAscii(trim(message));
     if (msg.empty())
         return false;
+
+    // Playerbots @target selector syntax is control traffic,
+    // not conversational content.
+    if (msg[0] == '@')
+    {
+        size_t selectorEnd =
+            msg.find_first_of(" \t\n\r\f\v");
+        std::string selector =
+            msg.substr(0, selectorEnd);
+        std::string commandTail =
+            selectorEnd == std::string::npos
+                ? std::string()
+                : trim(msg.substr(selectorEnd + 1));
+
+        static std::unordered_set<std::string>
+            selectorPrefixes = {
+                // Role / combat type
+                "@tank", "@dps", "@heal",
+                "@ranged", "@melee",
+                "@rangeddps", "@meleedps",
+
+                // Classes
+                "@dk", "@druid", "@hunter",
+                "@mage", "@paladin", "@priest",
+                "@rogue", "@shaman", "@warlock",
+                "@warrior",
+
+                // Raid target icons
+                "@star", "@circle", "@diamond",
+                "@triangle", "@moon", "@square",
+                "@cross", "@skull",
+
+                // Specs
+                "@hpal", "@ppal", "@rpal",
+                "@disc", "@hpr", "@spr",
+                "@arc", "@frost", "@fire",
+                "@arms", "@fury", "@pwar",
+                "@affl", "@demo", "@dest",
+                "@ele", "@enh", "@rsha",
+                "@bal", "@rdru",
+                "@bmh", "@mmh", "@svh",
+                "@mut", "@comb", "@sub",
+                "@fdk", "@udk"
+            };
+
+        bool knownSelector =
+            selectorPrefixes.find(selector)
+                != selectorPrefixes.end();
+        bool unconditionalSelector = false;
+
+        auto isDigits = [](std::string const& value)
+        {
+            if (value.empty())
+                return false;
+
+            return std::all_of(
+                value.begin(), value.end(),
+                [](unsigned char c)
+                {
+                    return std::isdigit(c) != 0;
+                });
+        };
+
+        if (!knownSelector
+            && selector.rfind("@group", 0) == 0)
+        {
+            std::string groupSelector =
+                selector.substr(6);
+            knownSelector =
+                !groupSelector.empty()
+                && std::any_of(
+                    groupSelector.begin(),
+                    groupSelector.end(),
+                    [](unsigned char c)
+                    {
+                        return std::isdigit(c) != 0;
+                    })
+                && std::all_of(
+                    groupSelector.begin(),
+                    groupSelector.end(),
+                    [](unsigned char c)
+                    {
+                        return std::isdigit(c) != 0
+                            || c == ',' || c == '-';
+                    });
+        }
+
+        if (!knownSelector && selector.size() > 1)
+        {
+            std::string levelSelector =
+                selector.substr(1);
+            size_t dash = levelSelector.find('-');
+
+            knownSelector =
+                isDigits(levelSelector)
+                || (dash != std::string::npos
+                    && isDigits(
+                        levelSelector.substr(0, dash))
+                    && isDigits(
+                        levelSelector.substr(dash + 1)));
+        }
+
+        if (!knownSelector)
+        {
+            std::string auraPrefix;
+            if (selector.rfind("@noaura", 0) == 0)
+                auraPrefix = "@noaura";
+            else if (selector.rfind("@aura", 0) == 0)
+                auraPrefix = "@aura";
+
+            if (!auraPrefix.empty())
+            {
+                std::string auraToken =
+                    selector.substr(auraPrefix.size());
+                if (auraToken.empty()
+                    && !commandTail.empty())
+                {
+                    size_t auraEnd =
+                        commandTail.find_first_of(
+                            " \t\n\r\f\v");
+                    auraToken = commandTail.substr(
+                        0, auraEnd);
+                }
+
+                if (isDigits(auraToken))
+                {
+                    knownSelector = true;
+                    unconditionalSelector = true;
+                }
+            }
+        }
+
+        if (!knownSelector
+            && selector.rfind("@aggroby", 0) == 0)
+        {
+            knownSelector = true;
+            unconditionalSelector = true;
+        }
+
+        if (unconditionalSelector)
+            return true;
+
+        if (knownSelector)
+        {
+            msg = commandTail;
+        }
+        else
+        {
+            if (selector == "@")
+                return false;
+
+            // Support @command forms such as @follow while
+            // preserving normal @name conversation.
+            msg = trim(msg.substr(1));
+        }
+
+        if (msg.empty())
+            return false;
+    }
 
     static std::unordered_set<std::string>
         exactCommands = {
@@ -1094,7 +1222,12 @@ void CleanupGroupSession(uint32 groupId)
     _groupDungeonCooldowns.erase(groupId);
     _groupWipeCooldowns.erase(groupId);
     _groupCorpseRunCooldowns.erase(groupId);
-    _emoteObserverCooldowns.erase(groupId);
+    ClearPvPCooldownsForGroup(groupId);
+    {
+        std::lock_guard<std::mutex> lock(
+            _emoteCooldownMutex);
+        _emoteObserverCooldowns.erase(groupId);
+    }
 
     // Prune combined-key (groupId<<32|questId) maps
     // unordered_map has no lower_bound — linear scan
@@ -1196,7 +1329,9 @@ public:
               "LLMChatterGroupPlayerScript",
               {PLAYERHOOK_CAN_PLAYER_USE_GROUP_CHAT,
                PLAYERHOOK_ON_CREATURE_KILL,
+               PLAYERHOOK_ON_CREATURE_KILLED_BY_PET,
                PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE,
+               PLAYERHOOK_ON_PVP_KILL,
                PLAYERHOOK_ON_LOOT_ITEM,
                PLAYERHOOK_ON_GROUP_ROLL_REWARD_ITEM,
                PLAYERHOOK_ON_PLAYER_ENTER_COMBAT,
@@ -1232,11 +1367,27 @@ public:
         HandleGroupCreatureKillImpl(killer, killed);
     }
 
+    // A pet or totem landing the killing blow fires this
+    // hook instead of OnPlayerCreatureKill; credit the owner.
+    void OnPlayerCreatureKilledByPet(
+        Player* petOwner, Creature* killed) override
+    {
+        HandleGroupCreatureKillImpl(petOwner, killed);
+    }
+
     void OnPlayerKilledByCreature(
         Creature* killer, Player* killed) override
     {
         HandleGroupPlayerKilledByCreatureImpl(
             killer, killed);
+    }
+
+    // Overworld PvP kills and deaths. Battleground kills
+    // stay with LLMChatterPlayerScript::OnPlayerPVPKill.
+    void OnPlayerPVPKill(
+        Player* killer, Player* killed) override
+    {
+        HandleGroupPvPKillImpl(killer, killed);
     }
 
     // Shared loot handler for both direct loot
@@ -1368,12 +1519,14 @@ void CheckGroupCombatState()
 // Forward declarations for sub-domain registration
 void AddLLMChatterGroupJoinScripts();
 void AddLLMChatterGroupQuestScripts();
+void AddLLMChatterDuelScripts();
 
 void AddLLMChatterGroupScripts()
 {
     AddLLMChatterGroupJoinScripts();
     new LLMChatterGroupPlayerScript();
     AddLLMChatterGroupQuestScripts();
+    AddLLMChatterDuelScripts();
 }
 
 

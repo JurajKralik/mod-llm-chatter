@@ -4,6 +4,7 @@
  */
 
 #include "LLMChatterAmbient.h"
+#include "LLMChatterBossDialogue.h"
 #include "LLMChatterConfig.h"
 #include "LLMChatterDelivery.h"
 #include "LLMChatterGuild.h"
@@ -11,6 +12,7 @@
 #include "LLMChatterGroupInternal.h"
 #include "LLMChatterNearby.h"
 #include "LLMChatterProximity.h"
+#include "LLMChatterProximityFight.h"
 #include "LLMChatterShared.h"
 
 #include "DatabaseEnv.h"
@@ -291,15 +293,19 @@ public:
                   WORLDHOOK_ON_STARTUP,
                   WORLDHOOK_ON_UPDATE}) {}
 
-    void OnAfterConfigLoad(bool /*reload*/) override
+    void OnAfterConfigLoad(bool reload) override
     {
         sLLMChatterConfig->LoadConfig();
+        if (reload && sLLMChatterConfig->IsEnabled())
+            LoadScriptedEmoteExclusions();
     }
 
     void OnStartup() override
     {
         if (!sLLMChatterConfig->IsEnabled())
             return;
+
+        LoadScriptedEmoteExclusions();
 
         CharacterDatabase.Execute(
             "DELETE FROM llm_chatter_messages "
@@ -329,10 +335,13 @@ public:
 
         _lastTriggerTime = 0;
         _lastDeliveryTime = 0;
+        _lastGeneralAudienceRefreshTime = 0;
         _lastEnvironmentCheckTime = 0;
         _lastTransportCheckTime = 0;
         _lastGoScanTime = 0;
-        _lastProximityScanTime = 0;
+        _lastOutdoorProximityScanTime = 0;
+        _lastInstanceProximityScanTime = 0;
+        _lastBossDialogueCheckTime = 0;
         _lastQuestFlushTime = 0;
         _lastGroupJoinFlushTime = 0;
         _lastRaidMoraleTime = 0;
@@ -350,19 +359,30 @@ public:
 
         uint32 now = getMSTime();
 
+        if (now - _lastGeneralAudienceRefreshTime >= 1000)
+        {
+            _lastGeneralAudienceRefreshTime = now;
+            RefreshGeneralAudienceSnapshot();
+        }
+
         if (now - _lastDeliveryTime
             >= sLLMChatterConfig->_deliveryPollMs)
         {
             _lastDeliveryTime = now;
             DeliverPendingMessages();
+            // Duel and PvP onlooker moments run on the delivery
+            // poll: emote steps are delivery-like output. The
+            // driver is cheap when nothing is pending.
+            if (sLLMChatterConfig->_proxChatterEnable)
+                ProcessPendingFightMoments();
         }
 
         if (SimulationEnabled())
         {
-            if (now - _lastProximityScanTime >= sLLMChatterConfig->_proxChatterScanInterval * 1000)
+            if (now - _lastOutdoorProximityScanTime >= sLLMChatterConfig->_proxChatterScanInterval * 1000)
             {
-                _lastProximityScanTime = now;
-                CheckProximityChatter();
+                _lastOutdoorProximityScanTime = now;
+                CheckProximityChatter(false);
             }
             return;
         }
@@ -425,13 +445,40 @@ public:
         }
 
         if (sLLMChatterConfig->_proxChatterEnable
-            && now - _lastProximityScanTime
-                >= sLLMChatterConfig
-                       ->_proxChatterScanInterval
+            && now - _lastOutdoorProximityScanTime
+                >= std::max<uint32>(
+                       1,
+                       sLLMChatterConfig
+                           ->_proxChatterOutdoorScanInterval)
                     * 1000)
         {
-            _lastProximityScanTime = now;
-            CheckProximityChatter();
+            _lastOutdoorProximityScanTime = now;
+            CheckProximityChatter(false);
+        }
+
+        if (sLLMChatterConfig->_proxChatterEnable
+            && now - _lastInstanceProximityScanTime
+                >= std::max<uint32>(
+                       1,
+                       sLLMChatterConfig
+                           ->_proxChatterInstanceScanInterval)
+                    * 1000)
+        {
+            _lastInstanceProximityScanTime = now;
+            CheckProximityChatter(true);
+        }
+
+        if (sLLMChatterConfig->_proxChatterEnable
+            && sLLMChatterConfig->_proxBossDialogueEnable
+            && now - _lastBossDialogueCheckTime
+                >= std::max<uint32>(
+                    1,
+                    sLLMChatterConfig
+                        ->_proxBossApproachCheckInterval)
+                    * 1000)
+        {
+            _lastBossDialogueCheckTime = now;
+            CheckBossProximityDialogue();
         }
 
         if (sLLMChatterConfig->_useGroupChatter
@@ -488,10 +535,13 @@ public:
 private:
     uint32 _lastTriggerTime = 0;
     uint32 _lastDeliveryTime = 0;
+    uint32 _lastGeneralAudienceRefreshTime = 0;
     uint32 _lastEnvironmentCheckTime = 0;
     uint32 _lastTransportCheckTime = 0;
     uint32 _lastGoScanTime = 0;
-    uint32 _lastProximityScanTime = 0;
+    uint32 _lastOutdoorProximityScanTime = 0;
+    uint32 _lastInstanceProximityScanTime = 0;
+    uint32 _lastBossDialogueCheckTime = 0;
     uint32 _lastQuestFlushTime = 0;
     uint32 _lastGroupJoinFlushTime = 0;
     uint32 _lastRaidMoraleTime = 0;

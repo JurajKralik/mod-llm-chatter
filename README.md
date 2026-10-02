@@ -32,269 +32,35 @@ Built from the ground up for **fantasy roleplay immersion**. Every system, perso
 
 ## Features
 
-* **Roleplay-First Personalities**: Every bot is a distinct character in Azeroth's story. Their dialogue is deeply rooted in their race, class, and assigned personality traits, dynamically enhanced by their specialized talent builds. Bots stay in character, a Forsaken warlock speaks nothing like a Draenei paladin, and both draw from the lore and culture of their people to feel like living, breathing inhabitants of the world.
-* **Persistent Personality & Memories**: Your companions remember you. Each bot carries a unique, permanent personality. Every dungeon you clear together, every boss you defeat, every achievement you earn, every level milestone, all of it is written into that bot's memory as a personal journal entry. The next time you group up, they might reference that time you wiped in Shadowfang Keep, or fondly recall discovering a hidden corner of Teldrassil together. Your relationship with each companion deepens over time, building the kind of shared history that makes a party of adventurers feel like old friends reunited at an inn.
-* **Background Stories**: Every bot has an origin. When a companion first joins your group, the LLM generates a short background story rooted in their race, class, and personality traits — where they were born, who raised them, and the events that shaped who they are. A blood elf mage might carry the scars of Silvermoon's fall; a dwarf warrior might have learned to fight in the pits beneath Ironforge. These backstories are persistent, surviving across sessions, and are occasionally woven into idle chatter and ambient dialogue, giving bots a subtle sense of personal history without ever breaking the flow of conversation. View and regenerate backstories anytime through the Chatter Companion addon.
-* **Deep Spatial & Lore Awareness**: Bots possess an intimate understanding of their surroundings, maintaining full awareness of both the broader world zones and the specific subzones within them. Whether you are wandering the vibrant paths of Elwynn Forest, traversing the vast snows of Dragonblight, or delving into the ancient mysteries of the Ruins of Mathystra in Darkshore, bots draw from over 3,000 unique descriptions to comment on the history, magic, and atmosphere of your exact location. In cities, they notice when you enter a new district, walking into the Cenarion Enclave or Krasus' Landing prompts a natural comment about the surroundings.
-* **Conscious World Sensing**: The world is alive, and your companions notice it. Bots dynamically react to everything in their vicinity, from wildlife and rare creatures to NPCs, ancient ruins, weathered statues, and eerie altars. They also observe functional points of interest like moonwells, crackling fireplaces, and bustling forges, while adapting to weather changes, the time of day, arriving zeppelins, and seasonal holidays.
-* **Organic Party Interactivity**: Your companions don't just follow; they interact. They will strike up multi-bot conversations, ask you unprompted questions about your journey, and react authentically to combat, loot, and quest milestones. Seamlessly integrated with the game's emote and voice systems, bots punctuate their dialogue with physical gestures and audible character voices, bringing an extra layer of life to everything from the thrill of an achievement to quiet banter by the campfire.
-* **A Living, Breathing World**: The immersion extends beyond your immediate party. The open world's General channel hums with ambient bot chatter, reacting to real player messages and world events. Guards, vendors, trainers, and citizens engage in proximity `/say` conversations as you walk past, your party bots join in too, slipping naturally between party chat and the world around them. In battlegrounds, bots shout tactical callouts rooted in faction pride, while in raids, they brace for encounters across 148 iconic bosses, sharing lore and rallying morale between pulls.
-* **Guild Hall Camaraderie**: Beyond the party and the open world,
-  your guild feels like a real group of adventurers instead of a silent
-  roster. Guildmates share stories, trade jokes, voice their opinions,
-  and fall into conversations of their own. Speak in Guild Chat and
-  they answer as familiar companions, remembering what has been said
-  and carrying shared threads forward naturally. When you return to
-  Azeroth, a warm welcome from your guild helps make the channel feel
-  like a community that was already alive before you arrived.
-* **Seamless Fantasy Immersion**: Designed to preserve the roleplay atmosphere, the module features smart pacing, multi-character conversation flow, and natural reading delays. No repetitive robotic spam, no fourth-wall breaks, just natural, in-character dialogue that deepens the fantasy of adventuring through Azeroth.
-* **Zero Server Impact**: All LLM processing runs in a separate bridge service with a thread-pool worker model. The game server simply drops event rows into the database and moves on, never waiting on an API call. Responses flow back through the same queue and are delivered on the next world tick, keeping your server performance completely unaffected.
-
----
-
-## Changelog
-
-### 2026-08-16 - Korean Language and Unicode Cleanup
-
-* **Korean language support**: `LLMChatter.Language = KO` now resolves
-  to Korean and applies the existing localized prompt rules.
-* **Unicode-safe emoji cleanup**: Emoji removal no longer treats the
-  entire range from U+24C2 through U+1F251 as emoji. Hangul, CJK, and
-  other scripts inside that former range are preserved.
-
-### Guild Channel Chatter
-
-* **Guild chatter**: Optional ambient Guild statements and
-  two- or three-bot conversations. C++ selects live participants;
-  the bridge gives the exchange one RP subject and cross-zone context,
-  adds irregular participant-name references when useful, then
-  delivers naturally staggered Guild lines. It is gated by
-  `GuildChatter.Chance`, `ConversationChance`, and `Cooldown`. The
-  master Guild Chat feature now defaults to enabled.
-* **Player-driven Guild replies**: Every eligible player Guild message
-  receives at least one bot reply. The response can be a single answer,
-  multiple independent answers, or a Guild conversation. Per-login
-  memory combines recent verbatim lines with a compact rolling summary,
-  supports subtle callbacks and opinion continuity, and is cleared on
-  both logout and login. Summary calls always reuse the configured
-  chatter provider and model.
-* **Guild login greetings**: A full real-player login schedules a
-  session-safe greeting without assuming playerbots are immediately
-  ready. Quick 2-5-second reactions remain possible, while ordinary and
-  busy delay bands make later greetings more common. Player speech,
-  logout, relogin, Guild changes, and stale sessions cancel the greeting.
-  Delivered greetings join the current Guild session history so an
-  immediate player reply retains the greeting as context.
-
-### 2026-06-19 - Chat-Type Master Toggles & Subsystem Classifier
-
-* **General channel master switch**: New
-  `LLMChatter.GeneralChannel.Enable` (default 1) silences **all**
-  General-channel chatter with a single value — ambient remarks, world
-  event reactions (weather, holidays, day/night — including the ones
-  that normally always fire), and replies to player General messages.
-  It takes effect immediately on `.reload config`, and also stops any
-  General messages already queued for delivery, not just new ones.
-* **Config key renamed (action may be required)**:
-  `LLMChatter.GeneralChat.Enable` is now
-  `LLMChatter.GeneralChat.PlayerReplyEnable`. It only ever governed
-  replies to player General messages; the new name makes that clear.
-  The old key is no longer read — if your config sets
-  `LLMChatter.GeneralChat.Enable`, rename it. To turn off *everything*
-  in General at once, use `LLMChatter.GeneralChannel.Enable` instead.
-* **GroupChatter toggle made authoritative**:
-  `LLMChatter.GroupChatter.Enable = 0` now also silences
-  emote-triggered party/raid reactions and drains already-queued group
-  messages, and the bridge stops attempting idle chatter and bot
-  questions while it is off. Raid-boss and Battleground chatter (which
-  share the party/raid channels) are unaffected. The solo NPC
-  emote-mirror stays governed by `LLMChatter.EmoteReactions.Enable`.
-* **Proximity toggle made authoritative**:
-  `LLMChatter.ProximityChatter.Enable = 0` now also drains already-
-  queued open-world say/msay lines, matching the other toggles.
-* **New `owner_subsystem` classifier**: Each row in
-  `llm_chatter_messages` is tagged with its owning subsystem (group,
-  raid, bg, general, proximity, ...). This lets the delivery layer
-  honor each master toggle even for in-flight messages without
-  affecting the other subsystems that share the same chat channel.
-* **Database Migration**: This update **adds a database column**. If
-  upgrading, apply
-  `data/sql/characters/updates/20260619_owner_subsystem.sql` (it is
-  idempotent and also runs automatically when worldserver starts).
-  Fresh installs already have the column from the base schema.
-
-### 2026-06-18 - Startup Health Check
-
-* **Automatic Setup Diagnostic**: The bridge now runs a built-in health
-  check at startup and prints a plain-language PASS/FAIL report to its
-  logs. It surfaces the most common "bots won't chat" causes — wrong
-  database credentials, a missing or leftover-placeholder API key, an
-  invalid key, or an unreachable local LLM — instead of failing
-  silently. On a critical failure the bridge logs a clear banner naming
-  the problem and the fix.
-* **Six Checks With Fix Hints**: Verifies the config loads and the module
-  is enabled, the database connection (distinguishing wrong
-  user/password, unreachable host, and wrong database name), the required
-  tables exist, the provider/API key is set and not a placeholder, and a
-  live LLM test call actually succeeds.
-* **Saved Report File**: The same report is written to
-  `logs/healthcheck.log` so it can be opened as a normal text file
-  without scraping container logs.
-* **Config Toggles**: `LLMChatter.HealthCheck.Enable` (default 1) and
-  `LLMChatter.HealthCheck.LLMProbe` (default 1) control the startup check
-  and whether it makes the live LLM test call. An optional
-  `LLMChatter.HealthCheck.LogPath` overrides the report file location.
-
-### 2026-06-05 - Addon Chat Ingestion Filter
-
-* **Hidden Addon Traffic Ignored**: Party, proximity, and General chat
-  ingestion now drops messages tagged `LANG_ADDON` before they can be
-  stored in chat history or sent to the LLM. This prevents Questie,
-  Multibot, DBM-style sync packets, and similar addon protocol payloads
-  from polluting bot context or memories.
-* **Party Hook Language Preservation**: The group chat hook now threads
-  AzerothCore's language flag through the player-message handler instead
-  of discarding it, allowing addon traffic to be filtered by the engine's
-  authoritative tag rather than brittle text heuristics.
-* **Debug Evidence Logging**: When `LLMChatter.DebugLog = 1`, ignored
-  addon packets are logged with chat type, player, byte length, and an
-  escaped preview so server owners can verify filtering without storing
-  raw addon traffic in LLM-facing history tables.
-
-### 2026-06-02 - Loot Reaction Chance Configuration
-
-* **Configurable Epic and Legendary Loot Reactions**:
-  `LLMChatter.GroupChatter.LootChancePurple` and
-  `LLMChatter.GroupChatter.LootChanceOrange` now control party loot
-  reaction chances for purple and orange items instead of treating both
-  as hardcoded 100% triggers.
-* **Quality-Specific Loot Gates**: Group loot reactions now use separate
-  configured chances for green, blue, purple, and orange item quality.
-  Artifact and heirloom quality loot still always triggers.
-* **Config Visibility**: The chatter bridge startup summary now prints
-  the purple and orange loot chance values alongside green and blue.
-
-### 2026-06-02 - Language Configuration Reliability
-
-* **German and Common Language Codes**: `LLMChatter.Language` now ships
-  built-in support for `DE`, `ES`, `PT`, and `RU` in addition to
-  English and French. German no longer requires manually editing the
-  Python language map.
-* **Unknown Language Warnings**: The bridge now logs the configured and
-  resolved language at startup, and warns when an unknown language code
-  falls back to English.
-* **More Complete Language Prompting**: Group farewell generation and
-  ambient JSON repair retries now preserve the configured language rule
-  instead of falling back to plain English repair prompts.
-* **Localized Action Narration**: Conversation action prompts no longer
-  include an English action example for the model to copy. The prompt
-  now asks for short physical narration in the configured language.
-* **No Database Migration**: This update is Python/config-template only.
-  Restart the chatter bridge after changing `LLMChatter.Language`.
-
-### 2026-05-19 - Google Gemini and OpenRouter Provider Support
-
-* **Google Gemini Support**: Chatter can now use Google's
-  OpenAI-compatible Gemini endpoint. `gemini-3.1-flash-lite` is the
-  recommended Google model, with Gemini-specific reasoning/thinking
-  controls for reliable structured JSON output.
-* **OpenRouter Support**: Chatter can now use OpenRouter through its
-  OpenAI-compatible API. Recommended OpenRouter model slugs include
-  `anthropic/claude-haiku-4.5`, `openai/gpt-4o-mini`, and
-  `openai/gpt-4.1-mini`.
-* **Provider Setup Docs**: README and config examples now cover
-  Anthropic, OpenAI, Google, OpenRouter, and Ollama, including matching
-  provider-specific API key settings.
-* **Screenshot Vision Provider Coverage**: Screenshot vision setup now
-  documents OpenAI, Anthropic, Google, and OpenRouter provider options.
-* **Runtime Validation**: OpenRouter was tested live with both
-  `openai/gpt-4o-mini` and `anthropic/claude-haiku-4.5` across
-  pre-cache, ambient, proximity, group idle, player message, and
-  General-to-party relay paths. No truncation or malformed response
-  pattern was observed in the request log during testing.
-
-### 2026-05-11 - Immersion, Pacing, and Party Awareness
-
-* **General-to-Party Reactions**: Party bots can now react when they hear
-  another bot speaking in General chat. A grouped companion may comment on
-  what was said, naming the General speaker directly, and larger groups can
-  turn that moment into a short party conversation.
-* **Smoother Party Chat Flow**: Party chatter is now paced more carefully so
-  bot lines do not land in a noisy burst. Conversations feel calmer during
-  travel, idle moments, screenshots, nearby observations, and event reactions.
-* **Travel-Aware Companions**: Bots better understand how the group is moving.
-  They can account for walking, mounts, taxi flights, swimming, and transports,
-  which helps avoid awkward lines about doing something impossible in the
-  moment.
-* **Richer Ambient Gossip**: World chatter has more variety and better local
-  flavor. NPC gossip, bot gossip, weather, time of day, and seasonal context
-  are blended more consistently into ambient conversations.
-* **More Reliable Location Awareness**: Zone and subzone reactions now use the
-  location from the moment the event happened, reducing stale or misplaced
-  comments when the group is moving quickly.
-* **Weather Feels More Grounded**: Weather reactions now track player context
-  more carefully, so environmental comments are less likely to fire from the
-  wrong place or at the wrong time.
-* **Cleaner Emotes and Actions**: Bot gestures and physical actions are handled
-  more consistently, keeping messages readable while still adding character
-  when appropriate.
-* **Screenshot Vision Targeting Fixes**: Screenshot observations now choose
-  eligible grouped bots more accurately, improving who comments on what the
-  player sees.
-
-### 2026-04-17 — Background Stories
-
-* **LLM-Generated Origin Stories**: Every bot now receives a unique background story when they first join your group. Generated by the LLM based on the bot's race, class, and personality traits, each backstory covers birthplace, upbringing, and formative events — all grounded in Warcraft lore.
-* **Persistent Across Sessions**: Backstories are stored permanently alongside traits and tone. The same bot tells the same origin story every time they rejoin.
-* **Ambient Backstory Influence**: During idle party chatter (25% chance) and proximity /say conversations (15% chance), the bot's backstory is fed to the LLM, subtly influencing their dialogue without forcing explicit references. A bot raised in Lakeshire might comment on a quiet lake; one hardened by war might be blunter during downtime.
-* **Addon Integration**: The Chatter Companion addon now displays each bot's background story in a scrollable read-only panel below the tone field. Click "Regenerate Story" to request a fresh backstory from the LLM. Changing a bot's traits automatically clears and regenerates their backstory to stay consistent.
-* **Configurable**: Three new config keys control the feature: `LLMChatter.Backstory.Enable` (master toggle), `LLMChatter.Backstory.IdleChance` (default 25%), and `LLMChatter.Backstory.ProximityChance` (default 15%). All are bridge-scope — restart the chatter bridge after changes.
-* **Database Migration**: Run `data/sql/characters/updates/20260416_bot_backstory.sql` if upgrading from a previous version.
-
-### 2026-04-03 — Multidirectional Proximity Chatter
-
-* **Ambient `/say` Conversations**: NPCs and bots now talk to each other — and to you — via `/say` as you move through the world. Guards, vendors, trainers, citizens, and your party bots all participate. Conversations are brief and spatially grounded.
-* **Multi-Speaker Scenes**: 2-4 speakers exchange short lines with natural pauses. Speakers face each other when talking; NPCs return to their original orientation afterward.
-* **Player Reply**: Reply via `/say` within 30 seconds and the nearby speaker will respond. Up to 5 exchanges before the conversation winds down naturally.
-* **Name Addressing**: Speakers can address nearby bots, NPCs, and you by name.
-* **250+ Topic Pool**: Casual conversation seeds across 17 categories — weather, gossip, petty crime, food, travel, guard talk, children's chatter, and more.
-* **Fully Configurable**: 15 config keys control scan interval, trigger chance, cooldowns, conversation length, reply limits, and more.
-
-### 2026-04-01 — Raid Chatter Enhancements
-
-* **Raid Battle Cries**: When engaging enemies in a raid instance, a bot shouts a short battle cry in raid chat — race and class flavored. Configurable via `RaidChatter.BattleCryChance` (default 70%).
-* **Raid Banter**: Between-pull idle events now alternate 50/50 between motivational morale and casual banter (environment jokes, class jabs, loot drama commentary).
-* **Raid Idle Boost**: Idle chatter fires twice as often inside raid instances with half the cooldown, keeping the conversation flowing during dungeon crawls.
-* **Dead Bot Awareness**: Dead bots know they're dead. Their idle dialogue shifts to ghost humor, resurrection pleas, and floor commentary instead of pretending they're alive.
-* **Zone Transitions in Raids**: Bots now comment on subzone changes inside raid instances (e.g., moving between wings in Naxxramas).
-* **Morale Between Deaths**: Morale and banter chatter no longer gets blocked when party members are dead — only active combat suppresses it.
-* **Reliability Improvements**: Fixed duplicate message delivery and improved handling of truncated AI responses.
-
-### 2026-04-01 — State Callouts, Greeting Improvements, Parser Hardening
-
-* **Low Health & OOM Callouts**: Bots now vocalize when they're low on health or running out of mana. Configurable thresholds (`LowHealthThreshold`, `OOMThreshold`), chance, and cooldown. Automatically scales in battlegrounds (halved chance, doubled cooldown) to avoid spam.
-* **Time-of-Day Greetings**: Bot greetings now include the current time of day, preventing immersion-breaking lines like "good evening" when it's morning.
-* **Greeting Anti-Repetition**: Bots no longer echo each other's greetings when multiple join at once. Each bot reads the recent chat history and avoids repeating what others already said.
-* **Robust Response Handling**: Improved parser reliability — raw AI artifacts no longer leak into chat.
-* **State Callout Config**: Five new config keys for tuning health and mana callout behavior.
-
-### 2026-03-29 — Screenshot Vision, Emote Reactions, BG Improvements
-
-* **Screenshot Vision (Experimental)**: Bots can now see the actual game world through periodic screenshot analysis. A lightweight host-side agent captures your screen, sends it to a vision AI, and bots comment on what they see, from ancient ruins to glowing flora to approaching storms. Supports both GPT-4o-mini and Claude Haiku. See [Screenshot Vision](#screenshot-vision) for setup.
-* **Emote Reaction System**: Bots now react when you emote at them. `/wave` at a bot and they might wave back, `/flex` and they'll have something to say about it. Three reaction paths: silent mirror (bot mirrors your emote), verbal reaction (personal response), and observer comment (a nearby bot notices and chimes in). Covers all ~170 text emotes.
-* **Dungeon Context Injection**: Party chatter prompts now detect when you're inside a dungeon and inject dungeon-specific flavor instead of outdoor zone lore. Affects kill, loot, death, achievement, wipe, corpse run, and nearby object events.
-* **BG Chatter Quality Pass**: Reduced noise in battleground chatter, suppressed narrator actions in fast-paced BG events, unified the join path for cleaner group formation, and synced config defaults with tested values.
-* **Action & Emote Frequency**: `EmoteChance` and `ActionChance` config keys control how often bots include physical emotes and narrator actions in their messages.
-
-### 2026-03-22 — Persistent Memories & Personality Traits
-
-* **Persistent Bot Identities**: Each bot now carries a permanent personality (3 traits + role + farewell style) stored in `llm_bot_identities`. Traits survive across sessions and server restarts. Bump `LLMChatter.Memory.IdentityVersion` to force regeneration after prompt changes.
-* **Memory System**: 14 memory types (ambient, boss_kill, quest_complete, discovery, achievement, level_up, pvp_kill, bg_win/loss, wipe, dungeon, party_member, player_message, first_meeting) are generated via LLM and stored per bot-player pair. Memories are recalled during idle chatter, reunion greetings, and bot questions, creating recognizable callbacks to shared experiences.
-* **Configurable Generation & Recall**: Every memory type has a `*GenerationChance` config key controlling how often memories are created. Recall frequency is controlled by `IdleRecallChance` and `RecallChance` (reunion).
-* **Zone & Subzone Awareness in Prompts**: Zone flavor and subzone lore are now injected into quest, discovery, idle, and event prompts. The player's subzone is tracked from the moment bots join the group.
-* **Focused Memory Callbacks**: When bots recall shared memories, the references are clear and recognizable — not vague allusions.
-* **Message Length Controls**: Stricter length limits prevent wall-of-text messages.
-* **Database Migration**: Run `data/sql/characters/updates/20260320_bot_memory_system.sql` if upgrading from a previous version.
+* **Roleplay-first characters**: Bots speak as distinct inhabitants of
+  Azeroth, shaped by race, class, talents, personality, and lore. Natural
+  pacing, multi-character flow, emotes, and voices keep conversations
+  immersive.
+* **Persistent personalities and histories**: Each companion keeps a stable
+  identity, generated backstory, and memories of shared dungeons, bosses,
+  achievements, and milestones. Backstories can be viewed or regenerated
+  through the Chatter Companion addon.
+* **Location and world awareness**: More than 3,000 zone and subzone
+  descriptions ground dialogue in the surrounding lore. Bots notice nearby
+  creatures, NPCs, objects, points of interest, weather, time, transports,
+  and holidays.
+* **Interactive parties**: Companions banter with one another, ask the player
+  questions, and react to combat, loot, quests, achievements, and travel.
+* **Open-world PvP and duels**: Companions size up enemies of the opposing
+  faction by name, race, class, and level, react to ambushes, kills, deaths,
+  and ganks in character, and cheer or tease during duels. Nearby bots
+  outside the fight and party can react before, during, or after duels,
+  or after a PvP kill. Same-faction onlookers comment in `/say`;
+  opposite-faction ones emote. Low chances and shared cooldowns keep
+  these reactions restrained, and hidden enemy identities are omitted.
+* **Living public channels**: Ambient General chat, proximity `/say`, player
+  replies, battleground callouts, and encounter-aware raid dialogue make the
+  wider world feel populated.
+* **Social guild chat**: Guildmates greet returning players, answer messages,
+  hold conversations, and carry shared context forward during a session.
+* **Non-blocking architecture**: LLM work runs in a separate, concurrent
+  bridge service. Worldserver queues events and delivers completed responses
+  without waiting on provider calls.
 
 ---
 
@@ -302,7 +68,8 @@ Built from the ground up for **fantasy roleplay immersion**. Every system, perso
 
 1. Clone into `modules/` and build AzerothCore
 2. Copy `conf/mod_llm_chatter.conf.dist` to your config directory and name it `mod_llm_chatter.conf`
-3. Set your LLM provider and the matching API key (`LLMChatter.Anthropic.ApiKey`, `LLMChatter.OpenAI.ApiKey`, `LLMChatter.Google.ApiKey`, `LLMChatter.OpenRouter.ApiKey`, or no key when using Ollama)
+3. Set `LLMChatter.Provider`, `LLMChatter.Model`, and the matching API
+   key (Ollama does not need a key)
 4. Start worldserver once, or run `dbimport`, so AzerothCore applies the module's character database schema
 5. Start the Python bridge
 6. Play, bots start chatting when grouped with players
@@ -321,13 +88,19 @@ This module requires a working AzerothCore server with mod-playerbots. If you do
 |-------------|---------|
 | AzerothCore | [Playerbot branch](https://github.com/mod-playerbots/azerothcore-wotlk/tree/Playerbot) (WotLK 3.3.5a) |
 | mod-playerbots | [liyunfan1223/mod-playerbots](https://github.com/mod-playerbots/mod-playerbots) |
-| Python | 3.8+ |
+| Python | 3.10+ |
 | LLM Provider | Anthropic, OpenAI, Google Gemini, OpenRouter, or Ollama |
+
+Install the Python bridge dependencies from `tools/requirements.txt`.
+Anthropic deployments use the supported 1.x SDK; installing provider
+packages individually can bypass the module's compatibility constraints.
 
 ### Recommended Models
 
 Tested extensively with excellent results:
 - **Claude Haiku 4.5** (Anthropic),  fast, affordable, excellent quality
+- **GPT-5.6 Luna** (OpenAI), fast and inexpensive; use
+  `LLMChatter.OpenAI.ReasoningEffort = none` for short-form chatter
 - **GPT-4o-mini** (OpenAI),  great alternative, similar cost
 - **Gemini 3.1 Flash-Lite** (Google),  fast, cheap, tested with
   structured chatter and pre-cache JSON
@@ -339,13 +112,115 @@ Tested extensively with excellent results:
   `openai/gpt-4o-mini`, and `openai/gpt-4.1-mini`, useful when users
   want OpenRouter routing while keeping OpenAI-compatible calls
 
-Ollama is supported for local/free inference, but the module's advanced prompt architecture (structured JSON responses, system/user message separation, emote and action fields) demands strong instruction-following capabilities that smaller open-source models may not consistently deliver. For the best experience, we recommend Claude Haiku, GPT-4o-mini, GPT-4.1-mini, Gemini 3.1 Flash-Lite, or equivalent fast OpenRouter-hosted models such as Claude Haiku 4.5, GPT-4o-mini, or GPT-4.1-mini. See the config file header for provider setup details.
+Ollama is supported for local/free inference, but the module's structured
+JSON, system/user messages, emotes, and actions demand strong instruction
+following. Smaller open-source models may not deliver it consistently. For
+the best experience, use Claude Haiku, GPT-5.6 Luna, GPT-4o-mini,
+GPT-4.1-mini, Gemini 3.1 Flash-Lite, or an equivalent fast model through
+OpenRouter. See the config header for more provider guidance.
+
+### Provider and Model Setup
+
+Configuration uses unquoted `Key = value` lines. Copy model IDs exactly:
+direct-provider IDs look like `gpt-5.6-luna`, OpenRouter IDs use
+`vendor/model`, and Ollama IDs use the name and tag shown by `ollama list`.
+Leave an optional value empty after `=`. Keep comments on separate lines;
+the chatter parser treats an inline comment as part of the value.
+
+| Provider | Provider value | Model setting | Credential |
+|----------|----------------|---------------|------------|
+| Anthropic | `anthropic` | Exact Anthropic model ID | `LLMChatter.Anthropic.ApiKey` |
+| OpenAI | `openai` | Exact OpenAI API model ID | `LLMChatter.OpenAI.ApiKey` |
+| Google | `google` | Exact Gemini API model ID | `LLMChatter.Google.ApiKey` |
+| OpenRouter | `openrouter` | A `vendor/model` slug | `LLMChatter.OpenRouter.ApiKey` |
+| Ollama | `ollama` | A name/tag from `ollama list` | None |
+
+Ready-to-copy examples (replace only the placeholder key):
+
+```ini
+# Anthropic
+LLMChatter.Provider = anthropic
+LLMChatter.Model = claude-haiku-4-5-20251001
+LLMChatter.Anthropic.ApiKey = sk-ant-xxxxx
+
+# OpenAI Luna
+LLMChatter.Provider = openai
+LLMChatter.Model = gpt-5.6-luna
+LLMChatter.OpenAI.ApiKey = sk-xxxxx
+LLMChatter.OpenAI.ReasoningEffort = none
+LLMChatter.OpenAI.MaxTokensMultiplier = 4
+
+# Google Gemini
+LLMChatter.Provider = google
+LLMChatter.Model = gemini-3.1-flash-lite
+LLMChatter.Google.ApiKey = AIza-xxxxx
+
+# OpenRouter
+LLMChatter.Provider = openrouter
+LLMChatter.Model = anthropic/claude-haiku-4.5
+LLMChatter.OpenRouter.ApiKey = sk-or-v1-xxxxx
+
+# Local Ollama from a Docker bridge
+LLMChatter.Provider = ollama
+LLMChatter.Model = qwen3:8b
+LLMChatter.Ollama.BaseUrl = http://host.docker.internal:11434
+```
+
+Use only one provider recipe at a time. Existing credentials for inactive
+providers can remain in the file. Restart `ac-llm-chatter-bridge` after a
+provider or model change. The bridge chooses compatible token, temperature,
+and reasoning parameters automatically, then caches any explicit
+unsupported-parameter correction for the rest of that process.
+
+### Ignoring Visible Protocol Chat
+
+If a server-specific addon or command sends machine-readable data through
+visible player chat, Chatter can ignore it without blocking the message from
+the game's normal chat system:
+
+```ini
+LLMChatter.PlayerChat.IgnoredPrefixes = !addon:,.custom:
+```
+
+The comma-separated list applies to real-player Party, General, Guild, and
+`/say` input. Matching ignores leading whitespace and ASCII letter case and
+runs before Chatter stores history or queues LLM work. Use distinctive
+punctuation-bearing prefixes: configured entries are trimmed, and matching is
+literal rather than word-aware. Normal `SendAddonMessage` traffic already
+arrives as `LANG_ADDON` and does not need an entry. After the supporting C++
+version is installed, apply list changes with `.reload config`.
+
+For OpenAI Luna, `none` gives the lowest-latency behavior and permits the
+configured temperature. Higher reasoning efforts can consume more of the
+output budget, so the bridge applies `OpenAI.MaxTokensMultiplier` whenever
+hidden reasoning may be active. It omits temperature where the model does
+not support it. See the [official Luna model page](https://developers.openai.com/api/docs/models/gpt-5.6-luna).
+
+For Ollama, run `ollama pull <model>` on the Ollama host first. A host-run
+bridge normally uses `http://localhost:11434`; a Docker bridge normally uses
+`http://host.docker.internal:11434`. Do not append `/v1` to the configured
+base URL.
+
+Ollama's OpenAI-compatible endpoint does not accept a per-request context
+size. Set `OLLAMA_CONTEXT_LENGTH` before starting Ollama, or create a custom
+model whose Modelfile contains `PARAMETER num_ctx 4096`. Confirm the loaded
+value in the `CONTEXT` column from `ollama ps`. `Ollama.DisableThinking = 1`
+uses both the supported `reasoning_effort = none` request and `/no_think`
+fallback for compatible local models.
 
 ### Tuning the Chattiness
 
 The default config ships on the **chatty side** so you can
 experience all the features out of the box. If you prefer a
 quieter, more immersive atmosphere, the key knobs are below.
+
+An optional lower-volume template is available at
+[`conf/presets/mod_ll_chatter_quieter.conf.dist`](conf/presets/mod_ll_chatter_quieter.conf.dist).
+It is not automatically installed or loaded. To use it, back up your active
+config, then copy the preset to your server's module-config directory as
+`mod_llm_chatter.conf` and configure its database and provider credentials.
+Keep alternate presets in `conf/presets/`: files directly under
+`conf/*.conf.dist` are registered as required config filenames at build time.
 
 **Reducing General channel chatter** (ambient bot conversations
 in zone-wide chat):
@@ -381,6 +256,10 @@ LLMChatter.GroupChatter.QuestCompleteChance = 30  # default 50
 LLMChatter.GroupChatter.KillChanceNormal = 5    # default 20
 LLMChatter.GroupChatter.SpellCastChance = 10    # default 30
 
+# Open-world PvP and duel reactions
+LLMChatter.GroupChatter.PvP.KillChance = 40     # default 80
+LLMChatter.GroupChatter.Duel.StartChance = 30   # default 60
+
 # Nearby object/creature comments
 LLMChatter.GroupChatter.NearbyObjectChance = 5  # default 20
 ```
@@ -389,8 +268,27 @@ All values are percentages (0-100) unless noted. Setting any
 chance to `0` disables that trigger entirely. See the config
 file comments for the full list of tunable keys.
 
+**Tuning recent conversation context**:
+
+```ini
+# Recent Party transcript lines included in prompts (1-50)
+LLMChatter.ChatHistoryLimit = 10
+
+# Recent General lines per zone, both factions (1-50)
+LLMChatter.GeneralChat.HistoryLimit = 15
+```
+
+Increasing these limits can improve short-term continuity, but it also
+increases prompt size and token use. The General-specific value falls back
+to `ChatHistoryLimit` when omitted. These windows contain recent verbatim
+lines; they are not long-term memory or rolling summaries.
+
 ### Known Limitations
-- **Ollama / open-source models**: Local inference requires fast hardware (sub-5s responses). Models below 8B frequently produce malformed JSON, ignore length constraints, or echo prompt instructions. Cloud-hosted Ollama models vary in quality — reasoning models (deepseek, qwen3.5, glm) are incompatible. For reliable results, use Claude Haiku or GPT-4o-mini
+- **Ollama / open-source models**: Local inference needs fast hardware and
+  strong instruction following. Small or reasoning-heavy models can be slow,
+  return malformed JSON, or spend the output budget before producing visible
+  chat. Prefer an instruct/tool-capable 8B-or-larger model and enable
+  `LLMChatter.Ollama.DisableThinking` for compatible thinking models.
 - Ollama cloud models add routing overhead compared to direct Anthropic/OpenAI APIs
 
 ---
@@ -417,6 +315,8 @@ AiPlayerbot.RandomBotSayWithoutMaster = 0
 
 Copy `modules/mod-llm-chatter/conf/mod_llm_chatter.conf.dist` to `env/dist/etc/modules/` and rename it to `mod_llm_chatter.conf`. Open it in a text editor and set at minimum:
 - `LLMChatter.Provider`,  choose `anthropic`, `openai`, `google`, `openrouter`, or `ollama`
+- `LLMChatter.Model`, using the exact ID format shown in
+  [Provider and Model Setup](#provider-and-model-setup)
 - the matching provider API key, for example `LLMChatter.OpenRouter.ApiKey` when using OpenRouter (not needed for Ollama)
 
 **2. Add bridge to docker-compose.override.yml**
@@ -485,6 +385,8 @@ docker compose --profile dev up -d
 
 Copy `conf/mod_llm_chatter.conf.dist` to your server's config directory (typically `etc/modules/`) and rename it to `mod_llm_chatter.conf`. Open it in a text editor and set at minimum:
 - `LLMChatter.Provider`,  choose `anthropic`, `openai`, `google`, `openrouter`, or `ollama`
+- `LLMChatter.Model`, using the exact ID format shown in
+  [Provider and Model Setup](#provider-and-model-setup)
 - the matching provider API key, for example `LLMChatter.OpenRouter.ApiKey` when using OpenRouter (not needed for Ollama)
 
 **3. Initialize character tables**
@@ -594,6 +496,9 @@ LLMChatter.Screenshot.DBHost = 127.0.0.1
 ```
 
 Make sure your config also has the matching API key set (`LLMChatter.OpenAI.ApiKey`, `LLMChatter.Anthropic.ApiKey`, `LLMChatter.Google.ApiKey`, or `LLMChatter.OpenRouter.ApiKey`).
+The screenshot agent uses the same model-aware token-field negotiation as the
+bridge, so direct OpenAI reasoning/vision model IDs do not require a separate
+`max_tokens` workaround.
 
 **4. Restart the chatter bridge**
 
@@ -619,7 +524,7 @@ Make sure WoW is in the foreground (the agent only captures when WoW is the acti
 
 - The agent saves screenshots to `modules/mod-llm-chatter/logs/screenshots/` so you can see exactly what the AI is analyzing
 - If bots aren't saying anything, check that the agent terminal shows `Queued observation:` messages
-- Cost is roughly **$0.05-0.10 per hour** of play with GPT-4o-mini
+- Vision cost varies with the provider, model, image size, and current pricing
 - You can stop the agent at any time (Ctrl+C) — the rest of the module continues working normally
 
 ---
@@ -636,8 +541,34 @@ Make sure WoW is in the foreground (the agent only captures when WoW is the acti
 > started before worldserver.
 
 **Existing installs** must apply migration scripts manually
-when updating to a newer version. Migrations live in
-`data/sql/characters/updates/` and are named by date:
+when updating to a newer version. Migrations live under
+`data/sql/*/updates/` and are named by date.
+
+### Required spell override repair
+
+Installations that loaded the optional talent data before April 9, 2026
+must apply the following world-database migration. Older versions inserted
+incomplete `spell_dbc` overrides that could cause spell-script validation
+warnings and hide real client spell effects. The migration only removes
+rows that still match that legacy placeholder shape and is safe to rerun.
+
+```bash
+# Docker
+docker exec -i ac-database mysql -uroot -ppassword acore_world < \
+  modules/mod-llm-chatter/data/sql/world/updates/20260913_remove_legacy_spell_dbc_placeholders.sql
+
+# Non-Docker
+mysql -uroot -ppassword acore_world < \
+  data/sql/world/updates/20260913_remove_legacy_spell_dbc_placeholders.sql
+```
+
+Restart worldserver after applying this repair so it reloads the restored
+client DBC records. Fresh installations using the current talent-data SQL
+do not create the incomplete rows and do not need this repair.
+
+### Character-database migrations
+
+Apply the relevant character migrations when upgrading:
 
 ```bash
 # Docker
@@ -686,6 +617,24 @@ docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
 docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
   modules/mod-llm-chatter/data/sql/characters/updates/20260725_guild_login_greeting.sql
 
+docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
+  modules/mod-llm-chatter/data/sql/characters/updates/20260827_widen_group_bot_traits.sql
+
+docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
+  modules/mod-llm-chatter/data/sql/characters/updates/20260830_message_action_emote.sql
+
+docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
+  modules/mod-llm-chatter/data/sql/characters/updates/20260908_instance_proximity_boss_events.sql
+
+docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
+  modules/mod-llm-chatter/data/sql/characters/updates/20260914_npc_multidirectional_interactions.sql
+
+docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
+  modules/mod-llm-chatter/data/sql/characters/updates/20260919_real_general_items.sql
+
+docker exec -i ac-database mysql -uroot -ppassword acore_characters < \
+  modules/mod-llm-chatter/data/sql/characters/updates/20260926_duel_events.sql
+
 # Non-Docker
 mysql -uroot -ppassword acore_characters < \
   data/sql/characters/updates/20260320_bot_memory_system.sql
@@ -731,6 +680,24 @@ mysql -uroot -ppassword acore_characters < \
 
 mysql -uroot -ppassword acore_characters < \
   data/sql/characters/updates/20260725_guild_login_greeting.sql
+
+mysql -uroot -ppassword acore_characters < \
+  data/sql/characters/updates/20260827_widen_group_bot_traits.sql
+
+mysql -uroot -ppassword acore_characters < \
+  data/sql/characters/updates/20260830_message_action_emote.sql
+
+mysql -uroot -ppassword acore_characters < \
+  data/sql/characters/updates/20260908_instance_proximity_boss_events.sql
+
+mysql -uroot -ppassword acore_characters < \
+  data/sql/characters/updates/20260914_npc_multidirectional_interactions.sql
+
+mysql -uroot -ppassword acore_characters < \
+  data/sql/characters/updates/20260919_real_general_items.sql
+
+mysql -uroot -ppassword acore_characters < \
+  data/sql/characters/updates/20260926_duel_events.sql
 ```
 
 Migrations are idempotent — safe to run on an already

@@ -22,13 +22,37 @@ from chatter_group_prompts import (
 from chatter_group_state import get_bot_mood_label
 from chatter_shared import (
     call_llm, cleanup_message,
+    get_chatter_mode,
     strip_speaker_prefix,
     pick_emote_for_statement,
     parse_single_response,
+    shorten_chat_message,
 )
 from chatter_constants import CLASS_NAMES, RACE_NAMES
 
 logger = logging.getLogger(__name__)
+
+
+def discard_ready_precache(db):
+    """Discard responses generated under a previous chatter mode.
+
+    The cache table predates mode-aware prompts and has no mode column.
+    Bridge startup is the mode-change boundary, so ready rows must not
+    survive a restart after ChatterMode changes.
+    """
+    cursor = db.cursor()
+    cursor.execute(
+        "DELETE FROM llm_group_cached_responses "
+        "WHERE status = 'ready'"
+    )
+    removed = max(0, int(cursor.rowcount or 0))
+    db.commit()
+    if removed:
+        logger.info(
+            "Discarded %d ready pre-cache responses at startup",
+            removed,
+        )
+    return removed
 
 
 # Category definitions with priority order.
@@ -227,7 +251,7 @@ def _get_recent_cached(db, group_id, bot_guid, cat):
 def _build_prompt(
     cat, prompt_type, bot_name, race, class_name,
     level, traits, mood, stored_tone, role,
-    recent_cached, combat_style,
+    recent_cached, combat_style, mode,
 ):
     """Dispatch to the correct prompt builder."""
     if prompt_type == 'state':
@@ -237,18 +261,21 @@ def _build_prompt(
             class_name, level, traits, mood,
             stored_tone,
             role=role, recent_cached=recent_cached,
+            mode=mode,
         )
     elif prompt_type == 'combat':
         return build_precache_combat_pull_prompt(
             bot_name, race, class_name, level,
             traits, mood, stored_tone,
             role=role, recent_cached=recent_cached,
+            mode=mode,
         )
     elif prompt_type == 'spell':
         return build_precache_spell_support_prompt(
             bot_name, race, class_name, level,
             traits, mood, stored_tone,
             role=role, recent_cached=recent_cached,
+            mode=mode,
         )
     elif prompt_type == 'spell_offensive':
         return build_precache_spell_offensive_prompt(
@@ -256,6 +283,7 @@ def _build_prompt(
             traits, mood, stored_tone,
             role=role, recent_cached=recent_cached,
             combat_style=combat_style,
+            mode=mode,
         )
     return None
 
@@ -306,6 +334,7 @@ def refill_precache_pool(db, client, config):
         return
 
     generated = 0
+    mode = get_chatter_mode(config)
 
     # Step 4: Iterate bots and categories
     for bot_row in bots:
@@ -400,6 +429,7 @@ def refill_precache_pool(db, client, config):
                 race, class_name, level, traits,
                 mood, stored_tone, role,
                 recent_cached, combat_style,
+                mode,
             )
             if not prompt:
                 continue
@@ -428,8 +458,7 @@ def refill_precache_pool(db, client, config):
             )
             if not message:
                 continue
-            if len(message) > 255:
-                message = message[:252] + "..."
+            message = shorten_chat_message(message)
 
             emote = parsed.get('emote')
 

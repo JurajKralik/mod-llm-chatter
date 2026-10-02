@@ -4,23 +4,20 @@ N9/N10 moved statement and conversation
 processing from the bridge.
 """
 
+import json
 import logging
 import random
 import time
 from typing import List
 
 from chatter_constants import (
-    CAPITAL_CITY_ZONES,
     AMBIENT_CHAT_TOPICS,
     AMBIENT_CHAT_TOPICS_RP,
 )
 from chatter_shared import (
-    zone_cache,
     parse_single_response,
     parse_conversation_response,
-    can_class_use_item,
     query_zone_quests,
-    query_zone_loot,
     query_zone_mobs,
     query_bot_spells,
     replace_placeholders,
@@ -30,10 +27,9 @@ from chatter_shared import (
     insert_chat_message,
     get_recent_zone_messages,
     is_too_similar,
-    select_message_type,
     calculate_dynamic_delay,
     get_chatter_mode,
-    _zone_last_delivery,
+    _reserve_zone_delivery_window,
     _zone_delivery_delay,
     get_zone_name,
     get_zone_flavor,
@@ -43,6 +39,8 @@ from chatter_shared import (
 )
 from chatter_shared import (
     build_talent_context,
+    build_gear_context,
+    attach_speaker_gear,
     build_zone_metadata,
     should_include_action,
 )
@@ -54,16 +52,23 @@ from chatter_group_general_reaction import (
     maybe_queue_group_general_reaction,
 )
 from chatter_text import pick_statement_length
+from chatter_identity import prepare_channel_persona
+from chatter_threads import (
+    general_key,
+    plan_idle_turn,
+    record_idle_exchange,
+    report_tokens,
+)
+from chatter_shared import count_conversation_items, get_race_faction
+from chatter_constants import RACE_NAMES
 from chatter_prompts import (
     build_plain_statement_prompt,
     build_quest_statement_prompt,
-    build_loot_statement_prompt,
     build_quest_reward_statement_prompt,
     build_spell_statement_prompt,
     build_trade_statement_prompt,
     build_plain_conversation_prompt,
     build_quest_conversation_prompt,
-    build_loot_conversation_prompt,
     build_trade_conversation_prompt,
     build_spell_conversation_prompt,
     build_gossip_statement_prompt,
@@ -73,6 +78,10 @@ from chatter_prompts import (
 logger = logging.getLogger(__name__)
 
 _gossip_target_cooldowns = {}
+_VALID_MESSAGE_TYPES = {
+    'plain', 'quest', 'quest_reward',
+    'trade', 'spell', 'npc', 'bot',
+}
 
 
 def _build_zone_metadata(zone_id, area_id=0):
@@ -93,79 +102,65 @@ def _build_zone_metadata(zone_id, area_id=0):
     )
 
 
-def _fetch_loot_data(config, zone_id, level):
-    """Fetch and select a loot item for the zone.
+def _general_thread_key(request, zone_id):
+    """Thread key of the zone General channel the speaking bot
+    posts in (General is split by faction)."""
+    race = request.get('bot1_race')
+    if not isinstance(race, int):
+        race = next(
+            (rid for rid, name in RACE_NAMES.items()
+             if name == race),
+            0,
+        )
+    return general_key(zone_id, get_race_faction(race))
 
-    Handles: query_zone_loot, cooldown filter,
-    quality weights, random.choices, mark_loot_seen.
 
-    Returns item_data dict or None if no loot found.
+def _request_message_type(request):
+    """Return the C++-selected ambient type.
+
+    Legacy or diagnostic rows without a type become plain. Python must
+    never reroll because trade requires the matching live snapshot.
     """
-    loot = query_zone_loot(config, zone_id, level)
-    if not loot:
-        return None
-    cooldown = int(config.get(
-        'LLMChatter.LootRecentCooldownSeconds', 0
-    ))
-    if cooldown > 0:
-        recent_ids = (
-            zone_cache.get_recent_loot_ids(
-                zone_id, cooldown
-            )
+    msg_type = request.get('message_type') or 'plain'
+    if msg_type not in _VALID_MESSAGE_TYPES:
+        logger.warning(
+            "Ambient queue %s has invalid message_type=%r; using plain",
+            request.get('id'), msg_type,
         )
-        filtered = [
-            item for item in loot
-            if item.get('item_id')
-            not in recent_ids
-        ]
-        if filtered:
-            loot = filtered
-    quality_weights = {
-        0: 35, 1: 30, 2: 22, 3: 10, 4: 3
-    }
-    weights = [
-        quality_weights.get(
-            item.get('item_quality', 2), 10
-        )
-        for item in loot
-    ]
-    item_data = random.choices(
-        loot, weights=weights, k=1
-    )[0]
-    if cooldown > 0 and item_data.get('item_id'):
-        zone_cache.mark_loot_seen(
-            zone_id, item_data['item_id']
-        )
-    return item_data
-
-
-def _select_gossip_or_existing_type(config, conversation=False):
-    """Select ambient type with optional NPC/bot gossip gates."""
-    npc_chance = max(0, int(config.get(
-        'LLMChatter.AmbientNpcGossipChance', 5
-    )))
-    bot_chance = max(0, int(config.get(
-        'LLMChatter.AmbientBotGossipChance', 5
-    )))
-    roll = random.randint(1, 100)
-    if roll <= npc_chance:
-        return 'npc'
-    if roll <= npc_chance + bot_chance:
-        return 'bot'
-
-    if not conversation:
-        return select_message_type()
-
-    roll = random.randint(1, 100)
-    if roll <= 45:
         return 'plain'
-    if roll <= 65:
-        return 'quest'
-    if roll <= 80:
-        return 'loot'
-    if roll <= 90:
-        return 'trade'
-    return 'spell'
+    return msg_type
+
+
+def _parse_trade_item_context(raw_context):
+    """Validate a server-captured seller inventory snapshot."""
+    if isinstance(raw_context, (str, bytes, bytearray)):
+        try:
+            raw_context = json.loads(raw_context)
+        except (TypeError, ValueError, json.JSONDecodeError,
+                UnicodeDecodeError):
+            return None
+    if not isinstance(raw_context, dict):
+        return None
+
+    required_ints = (
+        'item_id', 'item_quality', 'item_count', 'sell_price',
+    )
+    for key in required_ints:
+        value = raw_context.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+
+    item_name = raw_context.get('item_name')
+    if not isinstance(item_name, str) or not item_name.strip():
+        return None
+    if (
+        raw_context['item_id'] <= 0
+        or not 0 <= raw_context['item_quality'] <= 7
+        or raw_context['item_count'] <= 0
+        or raw_context['sell_price'] < 0
+    ):
+        return None
+    return dict(raw_context)
 
 
 def _get_gossip_target_cooldown(config):
@@ -270,21 +265,12 @@ def process_statement(
     zone_meta = _build_zone_metadata(
         zone_id, area_id
     )
-    msg_type = _select_gossip_or_existing_type(config)
-
-    # Skip loot/trade in capital cities (no zone
-    # creatures to reference, causes empty queries)
-    if (
-        msg_type in ("loot", "trade")
-        and zone_id in CAPITAL_CITY_ZONES
-    ):
-        msg_type = "plain"
+    msg_type = _request_message_type(request)
 
 
     # Get zone data if needed
     quest_data = None
     item_data = None
-    item_can_use = False
     spell_data = None
     gossip_target = None
     gossip_target_type = None
@@ -298,28 +284,16 @@ def process_statement(
         else:
             msg_type = "plain"  # Fallback
 
-    if msg_type == "loot":
-        item_data = _fetch_loot_data(
-            config, zone_id, bot['level']
-        )
-        if item_data:
-            # Check if bot's class can use the item
-            item_can_use = can_class_use_item(
-                bot['class'],
-                item_data.get('allowable_class', -1)
-            )
-            quality_names = {
-                0: "gray", 1: "white", 2: "green",
-                3: "blue", 4: "epic"
-            }
-        else:
-            msg_type = "plain"  # Fallback
-
     if msg_type == "trade":
-        item_data = _fetch_loot_data(
-            config, zone_id, bot['level']
+        item_data = _parse_trade_item_context(
+            request.get('item_context')
         )
         if not item_data:
+            logger.warning(
+                "Ambient trade queue %s has no valid inventory snapshot; "
+                "using plain",
+                request.get('id'),
+            )
             msg_type = "plain"  # Fallback
 
     if msg_type == "spell":
@@ -354,6 +328,13 @@ def process_statement(
         db, zone_id
     )
 
+    bot['gear'] = build_gear_context(
+        db, bot['guid'], bot['class'], config,
+    )
+    bot['persona'] = prepare_channel_persona(
+        db, client, config, bot['guid'], bot['name'], 'general',
+    )
+
     # Talent context injection (speaker only)
     speaker_talent = None
     talent_chance = int(config.get(
@@ -376,6 +357,7 @@ def process_statement(
 
     # Build appropriate prompt
     chosen_topic = ""
+    thread_turn = None
     if msg_type == "plain":
         # Get zone mobs for context
         zone_mobs = []
@@ -391,8 +373,15 @@ def process_statement(
             if mode == 'roleplay'
             else AMBIENT_CHAT_TOPICS
         )
-        topic = random.choice(topic_pool)
-        chosen_topic = topic
+        thread_turn = plan_idle_turn(
+            _general_thread_key(request, zone_id),
+            [bot['name']], topic_pool=topic_pool, db=db,
+        )
+        topic = (
+            None if thread_turn is not None
+            else random.choice(topic_pool)
+        )
+        chosen_topic = topic or f"thread:{thread_turn.kind}"
         prompt = build_plain_statement_prompt(
             bot, zone_id, zone_mobs,
             config, current_weather,
@@ -401,19 +390,12 @@ def process_statement(
             topic=topic,
             area_id=area_id,
             length_hint=rng_length,
+            thread_turn=thread_turn,
         )
     elif msg_type == "quest":
         prompt = build_quest_statement_prompt(
             bot, quest_data, config,
             current_weather,
-            recent_messages=recent_msgs,
-            speaker_talent_context=speaker_talent,
-            zone_id=zone_id,
-        )
-    elif msg_type == "loot":
-        prompt = build_loot_statement_prompt(
-            bot, item_data, item_can_use,
-            config, current_weather,
             recent_messages=recent_msgs,
             speaker_talent_context=speaker_talent,
             zone_id=zone_id,
@@ -469,7 +451,14 @@ def process_statement(
             if mode == 'roleplay'
             else AMBIENT_CHAT_TOPICS
         )
-        topic = random.choice(topic_pool)
+        thread_turn = plan_idle_turn(
+            _general_thread_key(request, zone_id),
+            [bot['name']], topic_pool=topic_pool, db=db,
+        )
+        topic = (
+            None if thread_turn is not None
+            else random.choice(topic_pool)
+        )
         prompt = build_plain_statement_prompt(
             bot, zone_id,
             config=config,
@@ -479,6 +468,7 @@ def process_statement(
             topic=topic,
             area_id=area_id,
             length_hint=rng_length,
+            thread_turn=thread_turn,
         )
 
     # Call LLM
@@ -486,8 +476,15 @@ def process_statement(
         zone_meta['speaker_talent'] = (
             speaker_talent
         )
+    if thread_turn is not None:
+        zone_meta['thread_move'] = thread_turn.kind
     response = call_llm(
         client, prompt, config,
+        max_tokens_override=(
+            int(config.get('LLMChatter.MaxTokens', 200))
+            + report_tokens()
+            if thread_turn is not None else None
+        ),
         context=f"ambient:{bot['name']}",
         label='ambient_statement',
         metadata=zone_meta,
@@ -520,12 +517,18 @@ def process_statement(
             msg_type, topic_label, bot['name'],
             extra,
         )
-        insert_chat_message(
+        message_id = insert_chat_message(
             db, bot['guid'], bot['name'], message,
             channel=channel,
             delay_seconds=extra,
             queue_id=request['id'],
             sequence=0,
+        )
+        # Adopted into the zone channel thread only once
+        # the line was actually sent.
+        record_idle_exchange(
+            thread_turn, response, [bot['name']],
+            [message_id],
         )
         if channel == 'general':
             maybe_queue_group_general_reaction(
@@ -579,6 +582,12 @@ def process_conversation(
         db, zone_id
     )
 
+    attach_speaker_gear(db, bots, config)
+    for b in bots:
+        b['persona'] = prepare_channel_persona(
+            db, client, config, b['guid'], b['name'], 'general',
+        )
+
     # Talent context injection (speaker only,
     # uses first bot as representative)
     speaker_talent = None
@@ -597,13 +606,9 @@ def process_conversation(
             perspective='speaker',
         )
 
-    # Select message type. Existing conversation mix is preserved
-    # unless an additive gossip gate wins first.
-    msg_type = _select_gossip_or_existing_type(
-        config, conversation=True
-    )
+    msg_type = _request_message_type(request)
 
-    # Get quest/loot/spell data if needed
+    # Get quest/trade/spell data if needed
     quest_data = None
     item_data = None
     spell_data = None
@@ -621,18 +626,16 @@ def process_conversation(
         else:
             msg_type = "plain"
 
-    if msg_type == "loot":
-        item_data = _fetch_loot_data(
-            config, zone_id, bots[0]['level']
-        )
-        if not item_data:
-            msg_type = "plain"
-
     if msg_type == "trade":
-        item_data = _fetch_loot_data(
-            config, zone_id, bots[0]['level']
+        item_data = _parse_trade_item_context(
+            request.get('item_context')
         )
         if not item_data:
+            logger.warning(
+                "Ambient trade queue %s has no valid inventory snapshot; "
+                "using plain",
+                request.get('id'),
+            )
             msg_type = "plain"
 
     if msg_type == "spell":
@@ -666,6 +669,7 @@ def process_conversation(
 
     # Build prompt
     chosen_topic = ""
+    thread_turn = None
     if msg_type == "plain":
         # Get zone mobs for context
         zone_mobs = []
@@ -681,8 +685,15 @@ def process_conversation(
             if mode == 'roleplay'
             else AMBIENT_CHAT_TOPICS
         )
-        topic = random.choice(topic_pool)
-        chosen_topic = topic
+        thread_turn = plan_idle_turn(
+            _general_thread_key(request, zone_id),
+            bot_names, topic_pool=topic_pool, db=db,
+        )
+        topic = (
+            None if thread_turn is not None
+            else random.choice(topic_pool)
+        )
+        chosen_topic = topic or f"thread:{thread_turn.kind}"
         prompt = build_plain_conversation_prompt(
             bots, zone_id, zone_mobs,
             config, current_weather,
@@ -690,6 +701,7 @@ def process_conversation(
             speaker_talent_context=speaker_talent,
             topic=topic,
             area_id=area_id,
+            thread_turn=thread_turn,
         )
     elif msg_type == "quest":
         prompt = build_quest_conversation_prompt(
@@ -726,13 +738,9 @@ def process_conversation(
             speaker_talent_context=speaker_talent,
             area_id=area_id,
         )
-    else:  # loot
-        prompt = build_loot_conversation_prompt(
-            bots, item_data, config,
-            current_weather,
-            recent_messages=recent_msgs,
-            speaker_talent_context=speaker_talent,
-            zone_id=zone_id,
+    else:
+        raise ValueError(
+            f"Unsupported ambient conversation type: {msg_type}"
         )
 
     # Call LLM
@@ -746,6 +754,9 @@ def process_conversation(
         zone_meta['speaker_talent'] = (
             speaker_talent
         )
+    if thread_turn is not None:
+        conversation_max_tokens += report_tokens()
+        zone_meta['thread_move'] = thread_turn.kind
     bot_names_ctx = ','.join(bot_names)
     response = call_llm(
         client, prompt, config,
@@ -781,12 +792,8 @@ def process_conversation(
                 )
 
         if messages:
-            # Zone gap applies to first message only;
-            # conversation followups stagger on top
-            base_delay = _zone_delivery_delay(
-                zone_id, config
-            )
-            cumulative_delay = base_delay
+            prepared = []
+            relative_delay = 0.0
             prev_msg_len = 0
             for i, msg in enumerate(messages):
                 bot_guid = bot_guids.get(
@@ -815,13 +822,36 @@ def process_conversation(
                         len(final_message), config,
                         prev_message_length=prev_msg_len,
                     )
-                    cumulative_delay += delay
+                    relative_delay += delay
                 prev_msg_len = len(final_message)
 
-                topic_label = (
-                    f" topic={chosen_topic}"
-                    if chosen_topic else ""
+                prepared.append((
+                    i, msg, bot_guid, final_message,
+                    relative_delay,
+                ))
+
+            # Reserve the entire sequence before any
+            # row is inserted. Other General producers
+            # then begin only after this conversation
+            # and the configured zone gap have ended.
+            base_delay = _reserve_zone_delivery_window(
+                zone_id, config,
+                duration_seconds=relative_delay,
+            )
+            topic_label = (
+                f" topic={chosen_topic}"
+                if chosen_topic else ""
+            )
+            queued_ids = []
+            queued_speakers = []
+            for (
+                i, msg, bot_guid, final_message,
+                relative_delay,
+            ) in prepared:
+                cumulative_delay = (
+                    base_delay + relative_delay
                 )
+
                 logger.info(
                     "[GEN-FLOW] ambient conv | "
                     "type=%s%s bot=%s delay=%.1fs "
@@ -831,14 +861,15 @@ def process_conversation(
                     cumulative_delay, i,
                     len(messages),
                 )
-                insert_chat_message(
+                queued_ids.append(insert_chat_message(
                     db, bot_guid,
                     msg['name'], final_message,
                     channel=channel,
                     delay_seconds=cumulative_delay,
                     queue_id=request['id'],
                     sequence=i,
-                )
+                ))
+                queued_speakers.append(msg['name'])
                 if channel == 'general':
                     maybe_queue_group_general_reaction(
                         db, config,
@@ -852,12 +883,17 @@ def process_conversation(
                     )
 
 
-            # Push zone timestamp to after the last
-            # message so the gap applies from the END
-            # of the conversation, not the start
-            _zone_last_delivery[zone_id] = (
-                time.monotonic() + cumulative_delay
-            )
             db.commit()
+            # Adopted into the zone channel thread only once
+            # every line was sent, and only if no line the
+            # model wrote was dropped on the way.
+            record_idle_exchange(
+                thread_turn, response,
+                sorted(set(queued_speakers)), queued_ids,
+                complete=(
+                    len(queued_ids)
+                    == count_conversation_items(response)
+                ),
+            )
             return True
     return False

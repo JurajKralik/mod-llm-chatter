@@ -13,7 +13,12 @@
 #define LLM_CHATTER_CONFIG_H
 
 #include "Define.h"
+#include <array>
+#include <atomic>
+#include <memory>
 #include <string>
+#include <vector>
+#include <unordered_set>
 
 class LLMChatterConfig
 {
@@ -27,6 +32,12 @@ public:
     void LoadConfig();
     bool IsEnabled() const { return _enabled; }
     bool IsDebugLog() const { return _debugLog; }
+    bool IsProximitySpeakerAllowed(uint32 creatureEntry) const;
+    bool IsProximitySpeakerDenied(uint32 creatureEntry) const;
+    bool IsProximityBossSpeakerDenied(uint32 creatureEntry) const;
+    bool IsDirectedNameStopword(std::string const& word) const;
+    bool IsCxxScriptedEmoteEntry(uint32 creatureEntry) const;
+    bool IsPlayerChatPrefixIgnored(std::string const& message) const;
 
     // General settings
     bool _enabled;
@@ -34,10 +45,15 @@ public:
     uint32 _triggerIntervalSeconds;
     uint32 _conversationChance;
     uint32 _triggerChance;
+    uint32 _ambientNpcGossipChance;
+    uint32 _ambientBotGossipChance;
+    uint32 _ambientTradeQualityWeightBonus;
     uint32 _cityChatterMultiplier;
     uint32 _maxPendingRequests;
     uint32 _maxBotsPerZone;
     uint32 _maxMessageLength;
+    std::shared_ptr<std::unordered_set<std::string> const>
+        _playerChatIgnoredPrefixes;
 
     // Delivery settings
     uint32 _deliveryPollMs;
@@ -192,6 +208,11 @@ public:
     uint32   _nearbyObjectMaxObjects;
     bool     _facingEnable;
 
+    // Send the LLM's action field as a /e text emote just
+    // before the spoken line. When false the action stays
+    // inlined in the message as *asterisks*.
+    bool     _actionAsEmote;
+
     // Group chatter - state-triggered callouts
     bool _stateCalloutEnabled;
     bool _stateCalloutLowHealth;
@@ -199,6 +220,21 @@ public:
     bool _stateCalloutAggro;
     uint32 _stateCalloutChance;   // 0-100
     uint32 _stateCalloutCooldown; // seconds per bot
+
+    // Group chatter - overworld PvP encounters
+    bool _pvpChatterEnable;
+    uint32 _pvpCombatChance;      // 0-100
+    uint32 _pvpKillChance;        // 0-100
+    uint32 _pvpDeathChance;       // 0-100
+    uint32 _pvpCooldown;          // seconds per group
+    uint32 _pvpEnemyCooldown;     // seconds per enemy
+    bool _pvpTargetSwitchCallout;
+
+    // Group chatter - duels
+    bool _duelChatterEnable;
+    uint32 _duelStartChance;      // 0-100
+    uint32 _duelEndChance;        // 0-100
+    uint32 _duelCooldown;         // seconds per group
 
     // Pre-cached instant reactions
     bool _preCacheEnable;
@@ -224,6 +260,12 @@ public:
     uint32 _generalChatConversationChance;
     uint32 _generalChatHistoryLimit;
 
+    // Real bot loot announcements in General
+    bool _generalLootEnable;
+    uint32 _generalLootAggregationDelayMs;
+    uint32 _generalLootZoneCooldownSeconds;
+    uint32 _generalLootMinQuality;
+
     // RP enrichment
     uint32 _raceLoreChance;
 
@@ -234,9 +276,24 @@ public:
     uint32 _bgScoreMilestoneChance;
     uint32 _bgRaidWorkerChance;
     uint32 _bgStatePollingIntervalMs;
+    uint32 _bgABTransitionMaxGapMs;
+    uint32 _bgABNodeBatchCooldownSec;
+    uint32 _bgABPendingMaxAgeSec;
+    uint32 _bgABMaxNodesPerBatch;
+    std::vector<uint32> _bgABScoreMilestonePercents;
+    uint32 _bgABScoreCooldownSec;
+    uint32 _bgABObjectiveStatusIntervalSec;
+    uint32 _bgABObjectiveStatusChance;
+    bool _bgABEnable;
+    uint32 _bgABTimerEstimateMaxUncertaintySec;
+    uint32 _bgFactualMaxAgeSec;
+    uint32 _bgABFactualMaxAgeSec;
+    uint32 _bgMatchEndMaxAgeSec;
     uint32 _bgBigEventCooldownSec;
     uint32 _bgIdleChatterChance{25};
     uint32 _bgIdleChatterCooldownSec{30};
+    uint32 _bgFlagCarryChatterIntervalSec{45};
+    uint32 _bgFlagCarryChatterChance{50};
     uint32 _bgRezChance{20};
 
     // Raid chatter (PvE)
@@ -273,10 +330,16 @@ public:
 
     // Proximity chatter
     bool _proxChatterEnable;
+    bool _proxChatterEnableInDungeons;
+    bool _proxChatterEnableInRaids;
     uint32 _proxChatterScanInterval;
+    uint32 _proxChatterOutdoorScanInterval;
+    uint32 _proxChatterInstanceScanInterval;
     uint32 _proxChatterScanRadius;
     uint32 _proxChatterPlayerSayScanRadius;
     uint32 _proxChatterChance;
+    uint32 _proxChatterOutdoorChance;
+    uint32 _proxChatterInstanceChance;
     uint32 _proxChatterEntityCooldown;
     uint32 _proxChatterZoneFatigueThreshold;
     uint32 _proxChatterZoneFatigueDecay;
@@ -288,16 +351,77 @@ public:
     uint32 _proxChatterReplyMaxTurns;
     uint32 _proxChatterMaxTokensPerLine;
     uint32 _proxChatterFacingResetDelay;
+    uint32 _proxDirectedMaxExtraReactors;
+    uint32 _proxDirectedBotMaxParticipants;
+    std::array<uint32, 4> _proxDirectedExtraReactorWeights;
+    std::array<uint32, 2> _proxDirectedWitnessReactorWeights;
+    uint32 _proxDirectedNPCAsideChance;
+    uint32 _proxDirectedMaxLines;
+    uint32 _proxDirectedExpirySeconds;
+
+    // Proximity chatter - duel and PvP onlookers
+    bool _proxFightEnable;
+    uint32 _proxFightDuelChance;           // 0-100
+    uint32 _proxFightPvPChance;            // 0-100
+    uint32 _proxFightConversationChance;   // 0-100
+    uint32 _proxFightSecondMomentChance;   // 0-100
+    uint32 _proxFightThirdMomentChance;    // 0-100
+    uint32 _proxFightChallengeDelaySeconds;
+    uint32 _proxFightMidDelayMinSeconds;
+    uint32 _proxFightMidDelayMaxSeconds;
+    uint32 _proxFightPendingExpirySeconds;
+    uint32 _proxFightCompletedRetentionSeconds;
+    uint32 _proxFightLineMaxAgeSeconds;
+    uint32 _proxFightSceneCooldownSeconds;
+    uint32 _proxFightSceneCellYards;
+    std::shared_ptr<std::unordered_set<std::string> const>
+            _proxDirectedNameStopwords;
+    std::shared_ptr<std::unordered_set<uint32> const>
+            _proxSpeakerAllowEntries;
+    std::shared_ptr<std::unordered_set<uint32> const>
+            _proxSpeakerDenyEntries;
+    bool _proxBossDialogueEnable;
+    uint32 _proxBossApproachCheckInterval;
+    uint32 _proxBossApproachMaxRadius;
+    uint32 _proxBossAggroSafetyMargin;
+    uint32 _proxBossInitialDelayMin;
+    uint32 _proxBossInitialDelayMax;
+    uint32 _proxBossRepeatDelayMin;
+    uint32 _proxBossRepeatDelayMax;
+    uint32 _proxBossRepeatChance;
+    uint32 _proxBossRepeatChanceDecay;
+    uint32 _proxBossRepeatChanceFloor;
+    bool _proxBossUnlimitedAutomaticLines;
+    uint32 _proxBossMaxAutomaticLines;
+    uint32 _proxBossPresenceReset;
+    uint32 _proxBossDirectedReplyCooldown;
+    uint32 _proxBossDirectedScanCooldown;
+    std::shared_ptr<std::unordered_set<uint32> const>
+            _proxBossSpeakerDenyEntries;
 
     // Emote reaction system
     bool   _emoteReactionsEnable;
     uint32 _emoteMirrorChance;
     uint32 _emoteMirrorCooldown;
     uint32 _emoteReactionChance;
+    uint32 _emoteUngroupedBotMirrorChance;
+    uint32 _emoteUngroupedBotVerbalReactionChance;
+    uint32 _emoteUngroupedBotWitnessReactionChance;
+    uint32 _emotePartyBotWitnessChance;
     uint32 _emoteObserverChance;
     uint32 _emoteObserverCooldown;
     uint32 _emoteMoodSpreadChance;
     bool   _emoteNPCMirrorEnable;
+    uint32 _emoteNPCVerbalReactionChance;
+    uint32 _emoteNPCVerbalCooldown;
+    std::shared_ptr<std::unordered_set<uint32> const>
+            _emoteCxxScriptExclusionEntries;
+
+    // Free-text emotes (/e, /me). Unlike the ~244 named
+    // emotes these carry no id, so they can only ever
+    // produce a verbal reaction, never a mirrored anim.
+    bool   _emoteCustomEnable;
+    uint32 _emoteCustomMaxChars;
 
 private:
     LLMChatterConfig() = default;
