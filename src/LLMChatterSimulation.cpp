@@ -6,7 +6,6 @@
 #include "Config.h"
 #include "DatabaseEnv.h"
 #include "Group.h"
-#include "GroupMgr.h"
 #include "Guild.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
@@ -26,7 +25,8 @@ namespace
 {
 bool enabled = false;
 bool behavior = false;
-float radius = 40.0f;
+float radius = 60.0f;
+uint32 conversationPauseSeconds = 30;
 uint32 maxCandidates = 24;
 uint32 gapSeconds = 3;
 uint32 actionLeaseSeconds = 1800;
@@ -76,11 +76,10 @@ std::string LocalContext(Player* player)
 bool Owns(Player* bot, Player* player)
 {
     QueryResult result = CharacterDatabase.Query(
-        "SELECT player_guid,group_id FROM llm_sim_action_lease WHERE bot_guid = {}",
+        "SELECT player_guid FROM llm_sim_action_lease WHERE bot_guid = {} AND expires_at>UTC_TIMESTAMP()",
         bot->GetGUID().GetCounter());
-    return result && bot->GetGroup()
-        && result->Fetch()[0].Get<uint32>() == player->GetGUID().GetCounter()
-        && result->Fetch()[1].Get<uint32>() == bot->GetGroup()->GetGUID().GetCounter();
+    return result
+        && result->Fetch()[0].Get<uint32>() == player->GetGUID().GetCounter();
 }
 
 void Queue(Player* player, std::vector<Player*> candidates, std::string const& message,
@@ -122,6 +121,10 @@ void Queue(Player* player, std::vector<Player*> candidates, std::string const& m
             continue;
         if (count >= maxCandidates)
             break;
+        if (!message.empty() && (named(bot) || channel == "party" || channel == "raid"
+            || channel == "battleground"))
+            if (PlayerbotAI* ai = GET_PLAYERBOT_AI(bot))
+                ai->PauseForConversation(conversationPauseSeconds);
         if (count++)
             data << ',';
         data << "{\"guid\":" << bot->GetGUID().GetCounter() << ",\"name\":\""
@@ -131,10 +134,11 @@ void Queue(Player* player, std::vector<Player*> candidates, std::string const& m
         if (behavior && !bot->IsInCombat() && bot->IsAlive() && !bot->IsInFlight()
             && player->IsWithinDistInMap(bot, radius) && sRandomPlayerbotMgr.IsRandomBot(bot))
         {
-            if (!bot->GetGroup())
-                data << "\"follow_player\"";
-            else if (Owns(bot, player))
+            if (Owns(bot, player))
                 data << "\"follow_player\",\"stay_here\",\"resume_autonomous\"";
+            else if (!bot->GetGroup() || (bot->GetGroup() == player->GetGroup()
+                && GET_PLAYERBOT_AI(bot) && GET_PLAYERBOT_AI(bot)->GetMaster() == player))
+                data << "\"follow_player\"";
         }
         data << "]}";
     }
@@ -164,9 +168,7 @@ std::string ExecuteIntent(Player* bot, Player* player, std::string const& intent
     {
         if (!owned)
             return "not_simulation_owned";
-        ai->SetMaster(nullptr);
-        if (Group* group = bot->GetGroup())
-            group->RemoveMember(bot->GetGUID());
+        ai->ClearSocialFollow();
         ai->ResetStrategies();
         CharacterDatabase.DirectExecute("DELETE FROM llm_sim_action_lease WHERE bot_guid = {}",
             bot->GetGUID().GetCounter());
@@ -180,34 +182,15 @@ std::string ExecuteIntent(Player* bot, Player* player, std::string const& intent
     {
         if (!owned)
             return "not_simulation_owned";
+        ai->ClearConversationPause();
         ai->ChangeStrategy("-follow,+stay", BOT_STATE_NON_COMBAT);
         ai->DoSpecificAction("stay", Event(), true);
         return ai->HasStrategy("stay", BOT_STATE_NON_COMBAT) ? "" : "strategy_failed";
     }
-    if (bot->GetGroup() && !owned)
+    if (bot->GetGroup() && !owned && bot->GetGroup() != player->GetGroup())
         return "already_grouped";
-    if (owned && bot->GetGroup() != player->GetGroup())
-        return "group_changed";
-    if (!bot->GetGroup())
-    {
-        Group* group = player->GetGroup();
-        if (group && (group->IsFull() || group->isRaidGroup() || group->GetLeaderGUID() != player->GetGUID()))
-            return "group_unavailable";
-        if (!group)
-        {
-            group = new Group();
-            if (!group->Create(player))
-            {
-                delete group;
-                return "group_create_failed";
-            }
-            sGroupMgr->AddGroup(group);
-        }
-        if (!group->AddMember(bot))
-            return "group_join_failed";
-    }
     // Only fixed literals reach PlayerBots; no model text is a command.
-    ai->SetMaster(player);
+    ai->SetSocialFollow(player, actionLeaseSeconds);
     ai->ResetStrategies();
     ai->ChangeStrategy("-rpg,-grind,-stay,+follow", BOT_STATE_NON_COMBAT);
     ai->DoSpecificAction("follow", Event(), true);
@@ -218,12 +201,10 @@ std::string ExecuteIntent(Player* bot, Player* player, std::string const& intent
         "UTC_TIMESTAMP()+INTERVAL {} SECOND) ON DUPLICATE KEY UPDATE expires_at=VALUES(expires_at),"
         "group_id=VALUES(group_id)",
         bot->GetGUID().GetCounter(), player->GetGUID().GetCounter(),
-        bot->GetGroup()->GetGUID().GetCounter(), actionLeaseSeconds);
+        (bot->GetGroup() ? bot->GetGroup()->GetGUID().GetCounter() : 0), actionLeaseSeconds);
     if (!Owns(bot, player))
     {
-        ai->SetMaster(nullptr);
-        if (Group* group = bot->GetGroup())
-            group->RemoveMember(bot->GetGUID());
+        ai->ClearSocialFollow();
         ai->ResetStrategies();
         return "ownership_persistence_failed";
     }
@@ -235,9 +216,11 @@ void LoadSimulationConfig()
 {
     enabled = sConfigMgr->GetOption<bool>("LLMChatter.Simulation.Enable", false);
     behavior = sConfigMgr->GetOption<bool>("LLMChatter.Simulation.Behavior.Enable", false);
-    radius = std::clamp(sConfigMgr->GetOption<float>("LLMChatter.Simulation.ProximityRadius", 40.0f), 1.0f, 100.0f);
+    radius = std::clamp(sConfigMgr->GetOption<float>("LLMChatter.Simulation.ProximityRadius", 60.0f), 1.0f, 100.0f);
     maxCandidates = std::clamp(sConfigMgr->GetOption<uint32>("LLMChatter.Simulation.Conversation.MaxCandidates", 24), 1u, 40u);
     gapSeconds = std::clamp(sConfigMgr->GetOption<uint32>("LLMChatter.Simulation.Conversation.MinVisibleLineGap", 3), 1u, 60u);
+    conversationPauseSeconds = std::clamp(sConfigMgr->GetOption<uint32>(
+        "LLMChatter.Simulation.Behavior.ConversationPauseSeconds", 30), 5u, 120u);
     actionLeaseSeconds = std::clamp(sConfigMgr->GetOption<uint32>("LLMChatter.Simulation.Behavior.LeaseSeconds", 1800), 30u, 7200u);
 }
 
@@ -317,7 +300,12 @@ void DeliverSimulationMessage(uint32 id, uint32 botGuid, uint32 playerGuid,
         }
     }
     if (reason.empty())
+    {
+        if (intent == "none")
+            if (PlayerbotAI* ai = GET_PLAYERBOT_AI(bot))
+                ai->PauseForConversation(conversationPauseSeconds);
         reason = ExecuteIntent(bot, player, intent);
+    }
     bool sent = false;
     if (reason.empty())
     {
@@ -403,13 +391,11 @@ void SimulationTick()
         {
             if (PlayerbotAI* ai = GET_PLAYERBOT_AI(bot))
             {
-                // Never detach a bot that another real master took over.
-                if (bot->GetGroup() && bot->GetGroup()->GetGUID().GetCounter() == row[3].Get<uint32>()
+                // Release only the bounded social follow; party membership is independent.
+                if ((!bot->GetGroup() ? 0 : bot->GetGroup()->GetGUID().GetCounter()) == row[3].Get<uint32>()
                     && (!ai->GetMaster() || ai->GetMaster() == player))
                 {
-                    ai->SetMaster(nullptr);
-                    if (Group* group = bot->GetGroup())
-                        group->RemoveMember(bot->GetGUID());
+                    ai->ClearSocialFollow();
                     ai->ResetStrategies();
                 }
             }

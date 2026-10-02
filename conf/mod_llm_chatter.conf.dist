@@ -2658,7 +2658,7 @@ LLMChatter.Simulation.Competence.Weights = [8,20,40,22,8,2]
 LLMChatter.Simulation.Behavior.LeaseSeconds = 1800
 LLMChatter.Simulation.Enable = 0
 LLMChatter.Simulation.Behavior.Enable = 0
-LLMChatter.Simulation.ProximityRadius = 40
+LLMChatter.Simulation.ProximityRadius = 60
 LLMChatter.Simulation.Language.CzechPercent = 80
 LLMChatter.Simulation.Language.SlovakPercent = 20
 LLMChatter.Simulation.Reaction.UnknownPlayerChance = 30
@@ -2702,3 +2702,8 @@ LLMChatter.Simulation.Model.Strong.BaseUrl = http://127.0.0.1:18789/v1
 # Empty ApiKeyEnv inherits the matching upstream provider key.
 LLMChatter.Simulation.Model.Fast.ApiKeyEnv =
 LLMChatter.Simulation.Model.Strong.ApiKeyEnv =
+
+# Hold idle movement while talking; combat always resumes immediately.
+LLMChatter.Simulation.Behavior.ConversationPauseSeconds = 30
+# Optional single words, comma-separated; local replacement only.
+LLMChatter.Simulation.Profanity.Words = ""

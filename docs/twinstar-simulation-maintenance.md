@@ -41,8 +41,9 @@ while evaluating a major upstream update.
 Run the seven existing `tools/tests/test_*.py` scripts and new simulation unittest discovery. Run import
 checks with the installed bridge venv. Run CMake configuration only when the source list/build structure
 changes; otherwise use `cmake --build build --target worldserver -j2`. Never delete the build directory.
-Verify installed PlayerBots still clears an ungrouped random master's state, and recheck fixed action names
-and group/strategy APIs before altering the ownership adapter.
+Verify the small PlayerBots social-follow patch is present before building the adapter; the upstream
+ungrouped-master reset must preserve a valid bounded social follow. Recheck fixed action names and
+strategy APIs after rebasing.
 
 Core lint scripts scan existing code outside this module and report pre-existing issues. The module C++
 scan also reports existing upstream whitespace/qualifier/NPC-flag warnings; no diagnostic was emitted

@@ -131,7 +131,7 @@ def parse_response(raw, available_actions, length, identity, settings, rng):
     for severity in ('mild', 'medium', 'strong'):
         token = '__SWEAR_' + severity.upper() + '__'
         if token in text:
-            replacements = settings.profile['profanity'][identity['language']][severity]
+            replacements = settings.profanity_words or settings.profile['profanity'][identity['language']][severity]
             allow = settings.enabled('Profanity.Enable') and rng.random() < identity['personality']['toxicity']
             text = text.replace(token, rng.choice(replacements) if allow else '')
     if '__' in text:

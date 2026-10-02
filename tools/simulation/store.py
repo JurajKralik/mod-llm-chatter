@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timezone
 
 from simulation.domain import make_identity, memory_score, age_text
+from simulation.telemetry import record
 
 
 def transport_connect(config):
@@ -96,6 +97,8 @@ class Store:
             cur.execute('SELECT o.*,m.bot_name,m.message,m.delivered_at FROM llm_sim_outbox o JOIN llm_chatter_messages m ON m.id=o.message_id WHERE o.feedback_recorded=0 AND o.completed_at IS NOT NULL LIMIT 64')
             rows = cur.fetchall()
         for row in rows:
+            record('result', event=row['event_id'], message_id=row['message_id'], bot=row['bot_name'],
+                   message=row['message'], intent=row['intent'], status=row['status'], reason=row['reason'])
             # Cross-database replay-safe: unique source + relationship update in one transaction.
             if row['status'] == 'succeeded' and row['delivered_at']:
                 with self.db.cursor() as cur:

@@ -58,23 +58,23 @@ No model-provided arguments, GUIDs, coordinates, console commands, SQL or arbitr
 commands are accepted. Output must have exactly `respond`, `message`, `intent`, or only
 `respond:false` for silence. Duplicate JSON keys and unexpected fields are rejected.
 
-For this initial adapter, only eligible random bots can acquire simulation ownership. An ungrouped
-bot can follow a nearby real player, with a real group established if necessary. If the player already
-has a group they must lead it, it must have room, and it must not be a raid. Existing bots in unrelated
-groups are rejected. Follow intentionally means joining the player's group in this milestone.
+Eligible random bots can follow a nearby real player without joining or creating a party. A small
+PlayerBots extension keeps a bounded social-follow target across `UpdateAIGroupMaster()` updates.
+It stores a GUID and expiry; target lookup happens on use. Unrelated groups and another player's
+master remain protected. Explicit party invitations use normal PlayerBots acceptance and movement;
+`AiPlayerbot.SummonWhenGroup=0` disables invitation teleporting.
 
-Why grouping is necessary: the installed PlayerBots `UpdateAIGroupMaster()` explicitly clears the
-master of an ungrouped random bot. Merely setting master and the follow strategy would be undone.
-The adapter uses `Group::Create/AddMember`, `sGroupMgr->AddGroup`, `SetMaster`, `ResetStrategies`,
-`ChangeStrategy`, `HasStrategy`, and fixed-literal `DoSpecificAction("follow"/"stay", ..., true)`.
-Resume clears the simulation-owned master/group and resets default strategies. If that disbands the
-party before its acknowledgement, delivery falls back to a private whisper rather than dereferencing
-the vanished group. Ownership records
-include the exact group. Cleanup will not detach a bot that has acquired another master or group.
+The adapter uses `SetSocialFollow`, `ClearSocialFollow`, `ResetStrategies`, `ChangeStrategy`,
+`HasStrategy`, and fixed-literal `DoSpecificAction("follow"/"stay", ..., true)`. Resume and expiry
+release social ownership and reset strategies without removing party membership. Conversation
+holds pause idle AI actions for `Behavior.ConversationPauseSeconds` (default 30), while packet
+handlers, commands and combat continue. Random-bot recycling/teleporting is suspended during
+bounded social interactions. Simulation discovery and world `ListenRange.Say` are set to 60 yards.
+
 Ownership expires after a configurable interval or when the target is offline; checks are bounded
 at 64 ownership rows per sweep, so higher concurrent ownership counts need further scaling work.
 
-`succeeded` means the requested strategy/group transition was applied and dialogue was delivered.
+`succeeded` means the requested strategy transition was applied and dialogue was delivered.
 It does **not** prove pathfinding reached the target, or that a dungeon/run happened. Prompts explicitly
 forbid claiming an arrival or accomplishment. Navigation completion tracking is not implemented.
 An impossible action suppresses that proposed line and records a reason for subsequent context.
@@ -190,7 +190,7 @@ Simulation DB credentials inherit regular chatter credentials or can be overridd
 5. Run the normal bridge with its existing `--config` argument. It selects the simulation worker lane
    before any legacy provider health probe or background workers start.
 6. Log in with a real player beside an eligible ungrouped random bot. Say `<name> pojd se mnou`.
-   Verify one response, actual group/follow strategy, and a succeeded outbox row. Then say
+   Verify one response, actual follow movement without joining a party, and a succeeded outbox row. Then say
    `<name> uz bez` (and also test unnamed `uz bez` with stickiness), verify release and default behavior.
 7. Test logout/map change while a model call is in flight; stale output must not appear.
 
@@ -260,3 +260,18 @@ In simulation mode, unsupported legacy channels/events are deliberately silent s
 chatter cannot compete with the coordinator. This is a scope limitation, not completed channel support.
 The next step is restarting worldserver/bridge and running the real-player follow/resume test, then expanding
 behind this same coordinator and action validation boundary. See the maintenance document for patches.
+
+## Feedback control app and traces
+
+ZayoNet `/azerothcore-control/` owns start/stop/restart controls and three live consoles. Opening
+it starts a reconnecting two-second SSE stream, which closes with the page. Worldserver command
+input is available when managed by `ac-world`; launcher-managed servers still show live file logs.
+All-service start/stop includes the separate Python bridge process. Authserver and bridge consoles
+are log viewers. Chatter interactions read `tools/simulation-events.jsonl` (5 MB rotation, three
+backups) and group player input, speaker decision, model routing, reply, timing and delivery/action
+results by event. This is observable decision telemetry, not private model reasoning.
+
+AzerothCore Config lists the simulation tuning and allows adding/removing individual profanity
+words. `Profanity.Words` is a comma-separated list of up to 100 words, each at most 32 letters.
+It replaces optional swear placeholders locally only when `Profanity.Enable=1`; disabling it removes
+placeholders. Existing profile word pools remain the fallback for an empty custom list.

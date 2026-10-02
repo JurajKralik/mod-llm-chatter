@@ -71,4 +71,7 @@ def run(config):
                     sim.close()
                 if db:
                     db.close()
-            time.sleep(1)
+            try:
+                time.sleep(1)
+            except KeyboardInterrupt:
+                break

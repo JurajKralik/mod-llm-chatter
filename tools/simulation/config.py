@@ -5,7 +5,7 @@ from pathlib import Path
 
 PREFIX = 'LLMChatter.Simulation.'
 DEFAULTS = {
-    'Enable': 0, 'Behavior.Enable': 0, 'ProximityRadius': 40,
+    'Enable': 0, 'Behavior.Enable': 0, 'ProximityRadius': 60,
     'Language.CzechPercent': 80, 'Language.SlovakPercent': 20,
     'Reaction.UnknownPlayerChance': 30, 'Reaction.KnownPlayerChance': 65,
     'Reaction.DirectAddressChance': 100,
@@ -50,6 +50,10 @@ class Settings:
             raise ValueError('Profile must be a file name without a path')
         path = Path(__file__).resolve().parents[1] / 'simulation_profiles' / (name + '.json')
         self.profile = json.loads(path.read_text())
+        words = str(raw.get(PREFIX + 'Profanity.Words', '')).strip('"')
+        self.profanity_words = [word.strip() for word in words.split(',') if word.strip()]
+        if len(self.profanity_words) > 100 or any(not word.isalpha() or len(word) > 32 for word in self.profanity_words):
+            raise ValueError('Profanity.Words must be up to 100 single words of at most 32 letters')
         self.database = os.getenv('LLM_SIM_DATABASE', str(raw.get(PREFIX + 'Database.Name', 'acore_llm_sim')).strip('"'))
         self.competence_weights = json.loads(str(raw.get(PREFIX + 'Competence.Weights', '[8,20,40,22,8,2]')))
         if len(self.competence_weights) != 6 or min(self.competence_weights) < 0 or not sum(self.competence_weights):

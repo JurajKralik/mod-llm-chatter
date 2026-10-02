@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from simulation.domain import select_speaker, route, length_class, parse_response, relationship_label
 from simulation.prompts import build_prompt
 from simulation.store import Store, connect
+from simulation.telemetry import record
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +24,9 @@ def handle(event, transport, settings, rng=None, llm=None):
     if not isinstance(payload, dict) or payload.get('simulation_version') != 1:
         return finish(transport, event['id'], 'skipped')
     context = payload['context_key']
+    record('received', event=event['id'], context=context, channel=payload.get('channel'),
+           player=payload.get('player_name'), message=payload.get('player_message', ''),
+           candidates=[c['name'] for c in payload.get('candidates', [])])
     created = event['created_at']
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
@@ -62,6 +66,7 @@ def handle(event, transport, settings, rng=None, llm=None):
         chosen = select_speaker(candidates, payload.get('player_message', ''), previous, identities, relations, settings, rng, payload.get('direct_guid', 0))
         store.player_turn(context, event, payload)
         if not chosen:
+            record('decision', event=event['id'], summary='No speaker passed the reaction policy; stay silent.')
             return finish(transport, event['id'], 'skipped')
         bot = chosen['guid']
         from simulation.domain import fold
@@ -90,10 +95,15 @@ def handle(event, transport, settings, rng=None, llm=None):
         prompt = build_prompt(identities[bot], chosen, payload, recent, memories,
                               relationship_label(relations[bot], datetime.now(timezone.utc), settings),
                               length, actions, settings, store.results(bot, payload['player_guid']))
+        record('decision', event=event['id'], bot=chosen['name'], profile=tier,
+               model=str(settings.raw.get('LLMChatter.Simulation.Model.' + tier + '.Model', 'default')).strip('"'),
+               summary=('Directly addressed' if addressed else 'Selected by conversation and reaction policy'),
+               memories=len(memories), recent_turns=len(recent), length=length, allowed_actions=sorted(actions))
         raw = llm(None, prompt, settings.raw, max_tokens_override=220, profile=tier, label='simulation')
         # One model call in the first milestone. Malformed outputs fail closed without a second slow call.
         response = parse_response(raw, actions, length, identities[bot], settings, rng)
         if not response['respond']:
+            record('decision', event=event['id'], bot=chosen['name'], summary='Model chose silence.')
             return finish(transport, event['id'], 'skipped')
         if any(t['speaker'] == chosen['name'] and t['message'] == response['message'] for t in recent[-4:]):
             return finish(transport, event['id'], 'skipped')
@@ -117,10 +127,14 @@ def handle(event, transport, settings, rng=None, llm=None):
             cur.execute('UPDATE llm_sim_speaker SET lease_until=UTC_TIMESTAMP()+INTERVAL %s SECOND WHERE bot_guid=%s AND event_id=%s', (int(settings['Conversation.LeaseSeconds']), bot, event['id']))
         transport.commit()
         queued = True
+        record('reply', event=event['id'], message_id=mid, bot=chosen['name'], player=payload.get('player_name'),
+               channel=payload['channel'], message=response['message'], intent=response['intent'],
+               profile=tier, generation_ms=int(elapsed * 1000), status='queued')
         finish(transport, event['id'], 'completed')
         log.info('simulation profile=%s generation_ms=%d channel=%s speaker=%d', tier, int(elapsed * 1000), payload['channel'], bot)
     except Exception as exc:
         transport.rollback()
+        record('error', event=event['id'], summary='Response or event rejected', error=type(exc).__name__)
         log.warning('simulation event rejected: %s', type(exc).__name__)
         finish(transport, event['id'], 'skipped')
     finally:

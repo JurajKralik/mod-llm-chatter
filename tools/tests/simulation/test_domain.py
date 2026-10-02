@@ -63,6 +63,24 @@ class DomainTests(unittest.TestCase):
             result = parse_response(json.dumps({'respond': True, 'message': 'jo', 'intent': intent}), ACTIONS, 'tiny', self.identity, self.s, random.Random(2))
             self.assertEqual(result['intent'], intent)
 
+    def test_custom_profanity_single_words(self):
+        settings = Settings({'LLMChatter.Simulation.Profanity.Enable': 1,
+                             'LLMChatter.Simulation.Profanity.Words': 'sakra'})
+        identity = make_identity(3, settings)
+        identity['personality']['toxicity'] = 1
+        response = parse_response(json.dumps({'respond': True, 'message': '__SWEAR_MILD__ jo',
+                                             'intent': 'none'}), {'none'}, 'tiny', identity,
+                                  settings, random.Random(1))
+        self.assertEqual(response['message'], 'sakra jo')
+        disabled = Settings({'LLMChatter.Simulation.Profanity.Words': 'sakra'})
+        response = parse_response(json.dumps({'respond': True, 'message': '__SWEAR_MILD__ jo',
+                                             'intent': 'none'}), {'none'}, 'tiny', identity,
+                                  disabled, random.Random(1))
+        self.assertEqual(response['message'], 'jo')
+        for invalid in ('two words', 'word;command', '<markup>', 'word\nnext'):
+            with self.assertRaises(ValueError):
+                Settings({'LLMChatter.Simulation.Profanity.Words': invalid})
+
     def test_no_candidates_no_response(self):
         self.assertIsNone(select_speaker([], 'cau', 0, {}, {}, self.s, random.Random(1)))
 

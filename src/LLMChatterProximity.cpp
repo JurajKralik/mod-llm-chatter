@@ -1278,11 +1278,14 @@ std::string TrimChatMessage(
 
 std::vector<Player*> GetSimulationNearbyBots(Player* player, float scanRadius)
 {
-    std::vector<ProximityCandidate> candidates;
-    CollectNearbyBots(player, scanRadius, candidates);
+    std::list<Player*> nearby;
+    NearbyBotCheck check(player, scanRadius);
+    Acore::PlayerListSearcher<NearbyBotCheck> searcher(player, nearby, check);
+    Cell::VisitObjects(player, searcher, scanRadius);
     std::vector<Player*> bots;
-    for (auto const& candidate : candidates)
-        bots.push_back(candidate.bot);
+    for (Player* bot : nearby)
+        if (IsPlayerBot(bot) && bot->IsAlive() && !bot->IsFlying())
+            bots.push_back(bot);
     return bots;
 }
 
