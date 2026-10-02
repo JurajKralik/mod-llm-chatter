@@ -14,7 +14,7 @@ Do not expand the behavior allowlist until the named follow/resume loop works wi
 | 6 voice | CZ/SK contract, profile data, length classes, partial typography, profanity placeholders | Language validation, weighted slang/profanity entries, realistic typo tuning |
 | 7 event integration | SAY/whisper/group player messages and proximity background path | Guild/General/Trade/LFG, loot/quests/achievements/weather/raid/BG events; no competing legacy path |
 | 8 behavior transport | Strict three-action schema, result persistence, expiry and ownership | Separate accepted/executing/completion semantics, replay/crash stress matrix |
-| 9 adapter | Follow/stay/resume C++ compiled; actual grouping to preserve random-bot master | Live movement, come/join/leave, quest/grind, support/combat, RDF/BG, semantic travel |
+| 9 adapter | Follow/stay/resume compiled; bounded group-free social follow, conversation hold and invite movement installed | Live movement, come/join/leave, quest/grind, support/combat, RDF/BG, semantic travel |
 | 10 coherence | Actual delivery feeds bounded history, action failures enter future prompts | Dungeon organization, logical remote initiative, witnessed outcomes and memory |
 | 11 performance | 2,500 fixture bots -> 24 identities / 1 call / 1 message; EXPLAIN checks | Sustained live 2,500-bot test, two real players, production SQL/history profiling |
 | 12 docs | Architecture, setup/disable, configuration, baseline metrics and rebase notes | Final 26-point completion report after all accepted scope is implemented |
@@ -23,12 +23,13 @@ Do not expand the behavior allowlist until the named follow/resume loop works wi
 
 - Restart worldserver and bridge to load the installed binary and config.
 - With a real player near an eligible ungrouped random bot: `<name> pojd se mnou`.
-- Check exactly one reply, actual group membership and following, plus succeeded outbox feedback.
+- Check exactly one reply, following without party creation/joining, plus succeeded outbox feedback.
 - Say `<name> uz bez` and then test the unnamed continuation `uz bez` in another run.
-- Check group release and normal autonomous behavior. Repeat through party chat and whisper.
+- Check social-follow release and normal autonomous behavior; existing party membership stays independent. Repeat through party chat and whisper.
 - Log out or move away during generation: no stale local line/action.
 - Confirm a bot already owned/grouped by another real player is not taken over.
 - Confirm two distant observers can progress independently and nearby observers do not get duplicate scenes.
 
-As of deployment preparation no real player was online, no simulation event had been captured, and no
-outbox action result existed. These live checks remain pending and must not be reported as passed.
+The user has tested login and reported interaction feedback. The feedback changes are installed, and
+server/API/console checks pass. In-game follow/release, conversation/combat transitions and invite
+movement still need confirmation and must not be reported as passed.
