@@ -2638,3 +2638,67 @@ LLMChatter.Screenshot.BoundAccountId = 0
 #
 # LLMChatter.Screenshot.DBHost = 127.0.0.1
 
+
+
+###################################################################################################
+# TWINSTAR PLAYER SIMULATION — first end-to-end milestone (opt-in)
+# See docs/twinstar-simulation.md before enabling. Supported: SAY, whisper, party, raid/BG group chat.
+# Guild/General/Trade/LFG and legacy event chatter are suppressed in this milestone, not migrated yet.
+# Apply data/sql/simulation migrations first. Match Enable and Behavior.Enable in C++ and Python.
+# Only follow_player, stay_here, resume_autonomous are implemented; other intents fail closed.
+# Python settings require bridge restart. C++ reads Enable, Behavior.*, ProximityRadius,
+# MaxCandidates and MinVisibleLineGap on worldserver config reload. New C++ code needs a rebuild.
+# Database credentials default to the normal chatter DB credentials; optional override keys:
+# LLMChatter.Simulation.Database.Host/Port/User/Password, or LLM_SIM_DB_HOST/PORT/USER/PASSWORD.
+# LLM_SIM_DATABASE overrides Database.Name. Never put bearer tokens in version control.
+###################################################################################################
+LLMChatter.Simulation.Profile = twinstar_wotlk
+LLMChatter.Simulation.Database.Name = acore_llm_sim
+LLMChatter.Simulation.Competence.Weights = [8,20,40,22,8,2]
+LLMChatter.Simulation.Behavior.LeaseSeconds = 1800
+LLMChatter.Simulation.Enable = 0
+LLMChatter.Simulation.Behavior.Enable = 0
+LLMChatter.Simulation.ProximityRadius = 40
+LLMChatter.Simulation.Language.CzechPercent = 80
+LLMChatter.Simulation.Language.SlovakPercent = 20
+LLMChatter.Simulation.Reaction.UnknownPlayerChance = 30
+LLMChatter.Simulation.Reaction.KnownPlayerChance = 65
+LLMChatter.Simulation.Reaction.DirectAddressChance = 100
+LLMChatter.Simulation.Conversation.SpeakerStickiness = 0.35
+LLMChatter.Simulation.Conversation.MinVisibleLineGap = 3
+LLMChatter.Simulation.Conversation.MaxVisibleLineGap = 7
+LLMChatter.Simulation.Conversation.BotGlobalCooldown = 8
+LLMChatter.Simulation.Conversation.MaxCandidates = 24
+LLMChatter.Simulation.Conversation.LeaseSeconds = 120
+LLMChatter.Simulation.Conversation.MaxContexts = 512
+LLMChatter.Simulation.Conversation.IdleRetentionSeconds = 3600
+LLMChatter.Simulation.Conversation.RecentTurns = 12
+LLMChatter.Simulation.Conversation.EventMaxAgeSeconds = 90
+LLMChatter.Simulation.Conversation.Workers = 4
+LLMChatter.Simulation.MessageLength.TinyWeight = 60
+LLMChatter.Simulation.MessageLength.ShortWeight = 30
+LLMChatter.Simulation.MessageLength.MediumWeight = 9
+LLMChatter.Simulation.MessageLength.LongWeight = 1
+LLMChatter.Simulation.Memory.HalfLife.ephemeral = 0.5
+LLMChatter.Simulation.Memory.HalfLife.weak = 7
+LLMChatter.Simulation.Memory.HalfLife.normal = 45
+LLMChatter.Simulation.Memory.HalfLife.strong = 180
+LLMChatter.Simulation.Memory.HalfLife.landmark = 3650
+LLMChatter.Simulation.Memory.RecallLimit = 4
+LLMChatter.Simulation.Memory.CleanupThreshold = 0.02
+LLMChatter.Simulation.Relationship.DecayDays = 90
+LLMChatter.Simulation.Profanity.Enable = 0
+LLMChatter.Simulation.Model.Fast.Timeout = 25
+LLMChatter.Simulation.Model.Strong.Timeout = 60
+
+# Distinct models/agents must be provided by the operator. These examples are not auto-created.
+# Model names and endpoints are generic OpenAI-compatible settings, not OpenClaw internals.
+LLMChatter.Simulation.Model.Fast.Provider = openai
+LLMChatter.Simulation.Model.Fast.Model = openclaw/playerbots-fast
+LLMChatter.Simulation.Model.Fast.BaseUrl = http://127.0.0.1:18789/v1
+LLMChatter.Simulation.Model.Strong.Provider = openai
+LLMChatter.Simulation.Model.Strong.Model = openclaw/playerbots
+LLMChatter.Simulation.Model.Strong.BaseUrl = http://127.0.0.1:18789/v1
+# Empty ApiKeyEnv inherits the matching upstream provider key.
+LLMChatter.Simulation.Model.Fast.ApiKeyEnv =
+LLMChatter.Simulation.Model.Strong.ApiKeyEnv =
