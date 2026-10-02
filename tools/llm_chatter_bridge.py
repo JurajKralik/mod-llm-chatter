@@ -1215,6 +1215,10 @@ def main():
         time.sleep(60)
         config = parse_config(args.config)
 
+    if str(config.get('LLMChatter.Simulation.Enable', '0')).strip() == '1':
+        from simulation.runtime import run
+        return run(config)
+
     # Apply config-driven settings to shared module
     set_race_lore_chance(int(config.get(
         'LLMChatter.RaceLoreChance', 15

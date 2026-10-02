@@ -279,11 +279,15 @@ def call_llm(
     *,
     label: str = '',
     metadata: dict = None,
+    profile: str = None,
 ) -> str:
     """Call LLM API.
 
     Supports Anthropic, OpenAI, Google, OpenRouter, and Ollama.
     """
+    if profile is not None:
+        from simulation.models import client_for_profile
+        client, config = client_for_profile(config, profile)
     provider = config.get(
         'LLMChatter.Provider', 'anthropic'
     ).lower()
@@ -378,7 +382,8 @@ def call_llm(
             result = response.content[0].text.strip()
     except Exception as exc:
         logger.error(
-            "LLM call failed (%s): %s", label, exc
+            "LLM call failed (%s): %s", label,
+            type(exc).__name__ if profile else exc
         )
         result = None
     finally:
@@ -659,7 +664,8 @@ def quick_llm_analyze(
             result = response.content[0].text.strip()
     except Exception as exc:
         logger.error(
-            "LLM call failed (%s): %s", label, exc
+            "LLM call failed (%s): %s", label,
+            type(exc).__name__ if profile else exc
         )
         result = None
     finally:
