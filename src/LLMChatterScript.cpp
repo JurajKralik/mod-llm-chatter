@@ -1,3 +1,4 @@
+#include "LLMChatterSimulation.h"
 /*
  * mod-llm-chatter - registration coordinator
  */
@@ -12,6 +13,7 @@ void AddLLMChatterCommandScripts();
 
 void AddLLMChatterScripts()
 {
+    AddLLMChatterSimulationScripts();
     AddLLMChatterWorldScripts();
     AddLLMChatterGuildScripts();
     AddLLMChatterGroupScripts();

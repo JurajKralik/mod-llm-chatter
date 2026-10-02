@@ -1,3 +1,4 @@
+#include "LLMChatterSimulation.h"
 /*
  * mod-llm-chatter - world/event script ownership
  */
@@ -341,6 +342,7 @@ public:
 
     void OnUpdate(uint32 /*diff*/) override
     {
+        SimulationTick();
         UpdatePendingGuildLoginGreetings();
 
         if (!sLLMChatterConfig->IsEnabled())
@@ -353,6 +355,16 @@ public:
         {
             _lastDeliveryTime = now;
             DeliverPendingMessages();
+        }
+
+        if (SimulationEnabled())
+        {
+            if (now - _lastProximityScanTime >= sLLMChatterConfig->_proxChatterScanInterval * 1000)
+            {
+                _lastProximityScanTime = now;
+                CheckProximityChatter();
+            }
+            return;
         }
 
         if (now - _lastTriggerTime

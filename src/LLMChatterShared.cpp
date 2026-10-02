@@ -1,3 +1,4 @@
+#include "LLMChatterSimulation.h"
 /*
  * mod-llm-chatter - Shared helpers used across multiple translation units
  */
@@ -2087,6 +2088,9 @@ void QueueChatterEvent(
     uint32 expiresAfterSeconds,
     bool nullZeroNumeric)
 {
+    if (SimulationEnabled() && cooldownKey.rfind("sim:", 0) != 0)
+        return;
+
     auto NumSql = [nullZeroNumeric](uint32 value)
     {
         if (nullZeroNumeric && value == 0)
@@ -2416,6 +2420,9 @@ void SendPartyMessageInstant(
     const std::string& message,
     const std::string& emote)
 {
+    if (SimulationEnabled())
+        return;
+
     WorldPacket data;
     ChatHandler::BuildChatPacket(
         data,

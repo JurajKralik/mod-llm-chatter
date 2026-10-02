@@ -4,6 +4,7 @@
  */
 
 #include "LLMChatterConfig.h"
+#include "LLMChatterSimulation.h"
 #include "Config.h"
 #include "Log.h"
 
@@ -20,6 +21,7 @@ T GetChatterOption(std::string const& name, T const& def)
 
 void LLMChatterConfig::LoadConfig()
 {
+    LoadSimulationConfig();
     _enabled = GetChatterOption<bool>("LLMChatter.Enable", false);
     _debugLog = GetChatterOption<bool>("LLMChatter.DebugLog", false);
 
@@ -783,5 +785,14 @@ void LLMChatterConfig::LoadConfig()
         GetChatterOption<bool>(
             "LLMChatter.EmoteReactions."
             "NPCMirrorEnable", true);
+
+    // The milestone owns supported speech; don't run legacy social producers beside it.
+    // These fields are reloaded from their normal config when simulation is disabled.
+    if (SimulationEnabled())
+    {
+        _useGroupChatter = false;
+        _guildChatterEnable = false;
+        _generalChannelEnable = false;
+    }
 
 }

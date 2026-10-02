@@ -1,3 +1,4 @@
+#include "LLMChatterSimulation.h"
 /*
  * mod-llm-chatter - outbound message delivery ownership
  */
@@ -206,6 +207,14 @@ void DeliverPendingMessagesImpl()
         fields[14].IsNull()
             ? ""
             : fields[14].Get<std::string>();
+
+    if (ownerSubsystem == "simulation")
+    {
+        DeliverSimulationMessage(messageId, botGuid, playerGuid, message, channel);
+        return;
+    }
+    if (SimulationEnabled())
+        return; // Consume legacy rows; only the coordinator owns visible output.
 
     // Master General-channel toggle. If General chatter is
     // disabled, deliberately consume any already-queued General

@@ -1,3 +1,4 @@
+#include "LLMChatterSimulation.h"
 /*
  * mod-llm-chatter - group player/combat hook ownership
  *
@@ -793,6 +794,8 @@ void HandleGroupPlayerBeforeSendChatMessageImpl(
     std::string& msg)
 {
     HandleProximityPlayerSay(player, type, lang, msg);
+    if (SimulationEnabled())
+        return;
 
     if (type != CHAT_MSG_PARTY
         && type != CHAT_MSG_PARTY_LEADER)

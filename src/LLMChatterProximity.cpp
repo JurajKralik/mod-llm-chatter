@@ -3,6 +3,7 @@
  */
 
 #include "LLMChatterProximity.h"
+#include "LLMChatterSimulation.h"
 
 #include "LLMChatterConfig.h"
 #include "LLMChatterShared.h"
@@ -1275,8 +1276,25 @@ std::string TrimChatMessage(
 }
 } // namespace
 
+std::vector<Player*> GetSimulationNearbyBots(Player* player, float scanRadius)
+{
+    std::vector<ProximityCandidate> candidates;
+    CollectNearbyBots(player, scanRadius, candidates);
+    std::vector<Player*> bots;
+    for (auto const& candidate : candidates)
+        bots.push_back(candidate.bot);
+    return bots;
+}
+
 void CheckProximityChatter()
 {
+    if (SimulationEnabled())
+    {
+        for (Player* player : sRandomPlayerbotMgr.GetPlayers())
+            QueueSimulationLocal(player, "");
+        return;
+    }
+
     if (!sLLMChatterConfig
         || !sLLMChatterConfig->IsEnabled()
         || !sLLMChatterConfig->_proxChatterEnable
@@ -1307,6 +1325,13 @@ void HandleProximityPlayerSay(
     Player* player, uint32 type, uint32 language,
     std::string const& msg)
 {
+    if (SimulationEnabled())
+    {
+        if (player && !IsPlayerBot(player) && type == CHAT_MSG_SAY && language != LANG_ADDON)
+            QueueSimulationLocal(player, TrimChatMessage(msg));
+        return;
+    }
+
     if (!sLLMChatterConfig
         || !sLLMChatterConfig->IsEnabled()
         || !sLLMChatterConfig->_proxChatterEnable
